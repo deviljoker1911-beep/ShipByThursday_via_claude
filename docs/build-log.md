@@ -148,3 +148,52 @@ own account as the thing at risk. Galaxy needs a key from the Console.
 So the ledger stands: the GitHub reader is verified against live GitHub, and
 everything touching Anthropic — handoffs, sandbox, search, fetch, cost — is
 written, typechecked, and unproven.
+
+## Day 1 (cont.) — Pivot to a game
+
+### Emberhold
+Direction changed again: build an RTS. Not Age of Empires — that name and its
+contents belong to Microsoft — but an original game in the same genre, which is
+the part of the request that was ever interesting. Web canvas covers desktop,
+mobile and web from one codebase, and installs as a PWA, so "three platforms"
+costs nothing extra.
+
+Galaxy's deploy pipeline survived the pivot untouched: static export, CSP,
+Pages workflow. Only the CSP got tighter — the game makes no network calls at
+all after load, so `connect-src 'self'` and nothing else.
+
+### Two bugs, the same shape
+Both were found by the headless tests inside a second, and both would have
+looked identical on screen: a villager standing next to a tree doing nothing.
+
+**Distance to a building's centre is the wrong measurement.** A 3×3 town centre
+reaches 1.5 tiles from its centre and its footprint is impassable, so a villager
+pressed right against it sits 2.0 tiles from the centre. The "close enough to
+deliver?" test used 1.8. The villager could never satisfy it and could never get
+closer, so it waited forever holding ten wood. Fixed by measuring to the nearest
+point of the footprint rather than the centre — which also fixed attacking and
+constructing large buildings, both of which had the same latent bug with
+thresholds that happened to be just barely large enough.
+
+That one fix roughly halved the AI test's runtime, because the AI's villagers
+had been wedged in exactly the same way. The opponent wasn't weak; it was stuck.
+
+**Euclidean distance is the wrong test for adjacency.** Same shape one level
+down: the gather check wanted the villager within 1.3 tiles of the tree, but a
+villager on a neighbouring tile is up to ~1.41 away diagonally, further once the
+separation pass nudges it off-centre. Fixed by testing tile adjacency, which is
+what "can reach it" actually means, plus a fallback that looks for another tile
+rather than freezing when a spot genuinely can't be reached.
+
+The general lesson: any "am I close enough?" threshold tuned against an entity's
+centre is a freeze waiting for the right geometry. Measure to the thing the unit
+can actually touch.
+
+### Testing a game without being able to play it
+The browser pane throttles requestAnimationFrame to 1fps when unfocused —
+verified rather than assumed, by counting frames. So the sim runs headlessly
+instead: 14 tests that play out real matches in half a second. Map generation is
+checked across 40 seeds, because both freezes only appeared on particular
+terrain and a single lucky seed proves nothing.
+
+What this cannot tell me is whether the game is any fun. That needs hands on it.

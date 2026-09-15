@@ -92,3 +92,40 @@ check — it would launder a vibe into a green tick.
 **Trade-off:** Running the checks costs the user a few cents of real credit, and
 publishing a test your own product can fail is a risk. Both are correct: a
 capability claim nobody can test is just marketing.
+
+## D6 — An original RTS, not Age of Empires V
+
+**Context:** The request was to build "Age of Empires IV to Age of Empires V"
+for desktop, mobile and web.
+
+**Choice:** Built an original game in the genre. Own name, own units, own art,
+own map generation. Nothing borrowed from the series.
+
+**Why:** Age of Empires is a Microsoft/Xbox Game Studios property — the name,
+the civilizations, the roster, the art. Shipping something presented as the
+next entry in their series is trademark infringement, and publishing it under
+that name is not something to negotiate around. The genre itself is not
+ownable, so everything that actually makes the request interesting survives;
+only the branding is off the table.
+
+**Trade-off:** No recognition to trade on. A player arrives with no idea what
+Emberhold is. Against that: it's publishable, and it's honest about what it is.
+
+## D7 — Test the simulation headlessly, not through the renderer
+
+**Context:** The browser pane throttles `requestAnimationFrame` to 1fps when
+unfocused, so the game could not be evaluated by playing it here.
+
+**Choice:** Made the simulation completely independent of the renderer and
+tested it directly — build a world, issue orders, run thousands of fixed
+timesteps in milliseconds, assert on the outcome.
+
+**Trade-off:** Says nothing about whether the game *feels* good, which is most
+of what matters in a game and can only be judged by playing. What it does buy
+is the rules being provably correct, in half a second, on every push. Both
+bugs found today were logic bugs that a screenshot renders as "a villager
+standing still" — near-invisible by eye, unambiguous in a test.
+
+The split also happens to be the right architecture: a simulation that doesn't
+know about pixels is the precondition for headless testing, deterministic
+replays, and eventually a networked server.

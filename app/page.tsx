@@ -1,314 +1,214 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { runRoom, type Turn } from "@/lib/agent";
-import { getBot } from "@/lib/bots";
-import { setGitHubToken } from "@/lib/github";
-import { estimateCost, formatCost, ZERO_USAGE, type Usage } from "@/lib/models";
-import {
-  DEFAULT_SETTINGS,
-  clearAll,
-  loadSettings,
-  loadSpend,
-  loadTranscript,
-  saveSettings,
-  saveSpend,
-  saveTranscript,
-  type Settings,
-} from "@/lib/storage";
-import { SettingsPanel } from "@/components/Settings";
-import { Composer } from "@/components/Composer";
-import { BotMessage, HandoffNote, HumanMessage, ToolNote } from "@/components/Message";
-import { Welcome } from "@/components/Welcome";
-import { VerifyPanel } from "@/components/Verify";
+import { BUILDINGS, UNITS } from "@/game/config";
+import { useGame } from "@/game/useGame";
+import type { BuildingKind, UnitKind } from "@/game/types";
 
-/** What's happening right now, above the committed transcript. */
-interface Live {
-  botId: string;
-  text: string;
-  tool: string | null;
+const BUILD_ORDER: BuildingKind[] = ["house", "farm", "barracks", "towncenter"];
+
+function cost(c: Partial<Record<string, number>>) {
+  return Object.entries(c)
+    .map(([r, n]) => `${n}${r[0].toUpperCase()}`)
+    .join(" ");
 }
 
-export default function Galaxy() {
-  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
-  const [transcript, setTranscript] = useState<Turn[]>([]);
-  const [live, setLive] = useState<Live | null>(null);
-  const [spend, setSpend] = useState(0);
-  const [input, setInput] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
-  const [showVerify, setShowVerify] = useState(false);
-  const [ready, setReady] = useState(false);
+function clock(seconds: number) {
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
 
-  const abortRef = useRef<AbortController | null>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
+export default function Page() {
+  const {
+    canvasRef,
+    hud,
+    placing,
+    newGame,
+    train,
+    startPlacing,
+    selectAllVillagers,
+    selectAllMilitary,
+    focusTownCentre,
+    handlers,
+  } = useGame();
 
-  // Hydrate from the browser after mount — localStorage doesn't exist during SSR.
-  useEffect(() => {
-    const s = loadSettings();
-    setSettings(s);
-    setTranscript(loadTranscript());
-    setSpend(loadSpend());
-    setGitHubToken(s.githubToken || null);
-    setReady(true);
-  }, []);
-
-  useEffect(() => {
-    if (ready) saveSettings(settings);
-    setGitHubToken(settings.githubToken || null);
-  }, [settings, ready]);
-
-  useEffect(() => {
-    if (ready) saveTranscript(transcript);
-  }, [transcript, ready]);
-
-  useEffect(() => {
-    if (ready) saveSpend(spend);
-  }, [spend, ready]);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [transcript, live]);
-
-  const stop = useCallback(() => {
-    abortRef.current?.abort();
-    abortRef.current = null;
-    setBusy(false);
-    setLive(null);
-  }, []);
-
-  const send = useCallback(async () => {
-    const text = input.trim();
-    if (!text || busy) return;
-    if (!settings.apiKey.trim()) {
-      setShowSettings(true);
-      return;
-    }
-
-    setError(null);
-    setInput("");
-
-    const withHuman: Turn[] = [...transcript, { kind: "human", text }];
-    setTranscript(withHuman);
-    setBusy(true);
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    // The room opens with whoever is listed first, and afterwards whoever last
-    // held the floor picks it back up.
-    const lastSpeaker = [...withHuman]
-      .reverse()
-      .find((t): t is Extract<Turn, { kind: "bot" }> => t.kind === "bot");
-    const startBotId =
-      lastSpeaker && settings.roster.includes(lastSpeaker.botId)
-        ? lastSpeaker.botId
-        : settings.roster[0];
-
-    // Accumulates locally: React state updates are async, and a handoff can
-    // fire several times before a render lands.
-    let working = withHuman;
-    let turnUsage: Usage = ZERO_USAGE;
-
-    try {
-      for await (const event of runRoom({
-        apiKey: settings.apiKey.trim(),
-        modelId: settings.modelId,
-        effort: settings.effort,
-        roster: settings.roster,
-        transcript: withHuman,
-        startBotId,
-        maxBotTurns: settings.maxBotTurns,
-        signal: controller.signal,
-      })) {
-        switch (event.type) {
-          case "bot_start":
-            setLive({ botId: event.botId, text: "", tool: null });
-            break;
-          case "text":
-            setLive((l) =>
-              l ? { ...l, text: l.text + event.delta, tool: null } : l,
-            );
-            break;
-          case "tool":
-            setLive((l) => (l ? { ...l, tool: event.detail } : l));
-            break;
-          case "bot_end":
-            if (event.text) {
-              working = [...working, { kind: "bot", botId: event.botId, text: event.text }];
-              setTranscript(working);
-            }
-            setLive(null);
-            break;
-          case "handoff":
-            working = [
-              ...working,
-              { kind: "handoff", from: event.from, to: event.to, brief: event.brief },
-            ];
-            setTranscript(working);
-            break;
-          case "usage":
-            turnUsage = event.usage;
-            break;
-          case "error":
-            setError(event.message);
-            break;
-          case "done":
-            if (event.reason === "turn_limit") {
-              setError(
-                `Stopped after ${settings.maxBotTurns} handoffs — the room was still going. Raise the limit in Settings if that was too early.`,
-              );
-            }
-            break;
-        }
-      }
-    } catch (err) {
-      if (!(err instanceof Error && err.name === "AbortError")) {
-        setError(err instanceof Error ? err.message : "Something went wrong.");
-      }
-    } finally {
-      setSpend((s) => s + estimateCost(turnUsage, settings.modelId));
-      setBusy(false);
-      setLive(null);
-      abortRef.current = null;
-    }
-  }, [input, busy, settings, transcript]);
-
-  const reset = () => {
-    stop();
-    clearAll();
-    setSettings(DEFAULT_SETTINGS);
-    setTranscript([]);
-    setSpend(0);
-    setError(null);
-    setShowSettings(false);
-  };
-
-  const roomBots = settings.roster.map(getBot).filter(Boolean);
+  const capped = hud.pop >= hud.popCap;
 
   return (
-    <div className="flex h-dvh flex-col">
-      <header className="flex shrink-0 items-center gap-3 border-b border-(--color-edge) px-4 py-3 sm:px-6">
-        <span className="text-sm font-semibold tracking-tight text-[#f2ece5]">Galaxy</span>
+    <div className="relative h-dvh w-full overflow-hidden">
+      <canvas
+        ref={canvasRef}
+        onContextMenu={(e) => e.preventDefault()}
+        {...handlers}
+      />
 
-        <div className="ml-1 flex -space-x-1.5">
-          {roomBots.map((b) => (
+      {/* Resources */}
+      <div className="pointer-events-none absolute inset-x-0 top-0 flex flex-wrap items-center gap-x-4 gap-y-1 bg-gradient-to-b from-black/75 to-transparent px-3 py-2 text-[13px] sm:px-4 sm:text-sm">
+        <span className="font-semibold tracking-tight text-[#f2ece5]">Emberhold</span>
+        <Stat label="Food" value={hud.food} color="#e0705a" />
+        <Stat label="Wood" value={hud.wood} color="#b08050" />
+        <Stat label="Gold" value={hud.gold} color="#e8c46a" />
+        <span className={capped ? "text-[#e0705a]" : "text-(--color-muted)"}>
+          Pop <span className="font-mono text-[#f2ece5]">{hud.pop}/{hud.popCap}</span>
+        </span>
+        <span className="ml-auto font-mono text-(--color-muted)">{clock(hud.time)}</span>
+      </div>
+
+      {/* Notices */}
+      {hud.notices.length > 0 && (
+        <div className="pointer-events-none absolute top-12 left-1/2 flex -translate-x-1/2 flex-col items-center gap-1">
+          {hud.notices.map((n, i) => (
             <span
-              key={b!.id}
-              title={`${b!.name} · ${b!.role}`}
-              className="flex size-6 items-center justify-center rounded-full border-2 border-(--color-ink) text-[10px] font-semibold"
-              style={{ background: `${b!.accent}28`, color: b!.accent }}
+              key={i}
+              className="rounded-md bg-black/75 px-3 py-1.5 text-xs text-[#e8a488]"
             >
-              {b!.name.slice(0, 1)}
+              {n}
             </span>
           ))}
         </div>
-
-        <div className="ml-auto flex items-center gap-2 text-[11px] text-[#5f574f]">
-          <span className="hidden font-mono sm:inline" title="Estimated spend on your key">
-            {formatCost(spend)}
-          </span>
-          {transcript.length > 0 && (
-            <button
-              onClick={() => {
-                stop();
-                setTranscript([]);
-                setError(null);
-              }}
-              className="rounded-md border border-(--color-edge) px-2 py-1 transition-colors hover:text-[#f2ece5]"
-            >
-              New room
-            </button>
-          )}
-          <button
-            onClick={() => setShowVerify(true)}
-            title="Prove the bots' tools actually execute"
-            className="rounded-md border border-(--color-edge) px-2 py-1 transition-colors hover:text-[#f2ece5]"
-          >
-            Verify
-          </button>
-          <button
-            onClick={() => setShowSettings(true)}
-            className="rounded-md border border-(--color-edge) px-2 py-1 transition-colors hover:text-[#f2ece5]"
-          >
-            Settings
-          </button>
-        </div>
-      </header>
-
-      <main className="min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6">
-        <div className="mx-auto flex max-w-3xl flex-col gap-5">
-          {ready && transcript.length === 0 && !live && (
-            <Welcome
-              hasKey={Boolean(settings.apiKey.trim())}
-              onOpenSettings={() => setShowSettings(true)}
-              onPick={(prompt) => setInput(prompt)}
-            />
-          )}
-
-          {transcript.map((turn, i) =>
-            turn.kind === "human" ? (
-              <HumanMessage key={i} text={turn.text} />
-            ) : turn.kind === "bot" ? (
-              <BotMessage key={i} botId={turn.botId} text={turn.text} />
-            ) : (
-              <HandoffNote key={i} from={turn.from} to={turn.to} brief={turn.brief} />
-            ),
-          )}
-
-          {live && live.text && (
-            <BotMessage botId={live.botId} text={live.text} streaming />
-          )}
-          {live && !live.text && (
-            <ToolNote botId={live.botId} detail={live.tool ?? "thinking"} />
-          )}
-          {live && live.text && live.tool && (
-            <ToolNote botId={live.botId} detail={live.tool} />
-          )}
-
-          {error && (
-            <p className="rounded-lg border border-[#5c2e22] bg-[#1d110c] px-4 py-3 text-sm text-[#e8a488]">
-              {error}
-            </p>
-          )}
-
-          <div ref={bottomRef} />
-        </div>
-      </main>
-
-      <Composer
-        value={input}
-        onChange={setInput}
-        onSend={send}
-        onStop={stop}
-        busy={busy}
-        disabled={!ready}
-        placeholder={
-          settings.apiKey.trim()
-            ? `Message ${roomBots.map((b) => b!.name).join(", ")}…`
-            : "Add your API key in Settings to begin…"
-        }
-      />
-
-      {showVerify && (
-        <VerifyPanel
-          apiKey={settings.apiKey}
-          modelId={settings.modelId}
-          effort={settings.effort}
-          onClose={() => setShowVerify(false)}
-          onSpend={(usd) => setSpend((s) => s + usd)}
-        />
       )}
 
-      {showSettings && (
-        <SettingsPanel
-          settings={settings}
-          onChange={setSettings}
-          onClose={() => setShowSettings(false)}
-          onReset={reset}
-        />
+      {placing && (
+        <div className="pointer-events-none absolute top-12 left-1/2 -translate-x-1/2 rounded-md bg-black/75 px-3 py-1.5 text-xs text-(--color-body)">
+          Placing {BUILDINGS[placing].name} — click a spot, Esc to cancel
+        </div>
+      )}
+
+      {/* Command bar */}
+      <div className="absolute inset-x-0 bottom-0 border-t border-(--color-edge) bg-(--color-panel)/95 backdrop-blur">
+        <div className="flex items-stretch gap-2 overflow-x-auto px-2 py-2 sm:px-3">
+          <div className="flex shrink-0 flex-col gap-1">
+            <span className="text-[10px] tracking-[0.12em] text-[#5f574f] uppercase">
+              Select
+            </span>
+            <div className="flex gap-1">
+              <Chip onClick={selectAllVillagers}>Villagers</Chip>
+              <Chip onClick={selectAllMilitary}>Army</Chip>
+              <Chip onClick={focusTownCentre}>Centre</Chip>
+            </div>
+          </div>
+
+          <div className="w-px shrink-0 bg-(--color-edge)" />
+
+          <div className="flex shrink-0 flex-col gap-1">
+            <span className="text-[10px] tracking-[0.12em] text-[#5f574f] uppercase">
+              Build <span className="normal-case opacity-70">(select a villager)</span>
+            </span>
+            <div className="flex gap-1">
+              {BUILD_ORDER.map((kind) => (
+                <Chip
+                  key={kind}
+                  active={placing === kind}
+                  onClick={() => startPlacing(kind)}
+                  sub={cost(BUILDINGS[kind].cost)}
+                >
+                  {BUILDINGS[kind].name}
+                </Chip>
+              ))}
+            </div>
+          </div>
+
+          {hud.canTrain.length > 0 && (
+            <>
+              <div className="w-px shrink-0 bg-(--color-edge)" />
+              <div className="flex shrink-0 flex-col gap-1">
+                <span className="text-[10px] tracking-[0.12em] text-[#5f574f] uppercase">
+                  Train
+                </span>
+                <div className="flex gap-1">
+                  {hud.canTrain.map((t) => (
+                    <Chip
+                      key={t.kind}
+                      disabled={!t.affordable}
+                      onClick={() => train(t.from, t.kind)}
+                      sub={cost(UNITS[t.kind].cost)}
+                    >
+                      {UNITS[t.kind].name}
+                    </Chip>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+
+          <div className="ml-auto flex shrink-0 items-end">
+            <span className="px-2 pb-1 text-[11px] text-(--color-muted)">
+              {hud.selection.length === 0
+                ? "Drag to select · right-drag to pan"
+                : hud.selection
+                    .map((s) => `${s.count}× ${labelFor(s.kind)}`)
+                    .join(", ")}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {hud.outcome !== "playing" && (
+        <div className="absolute inset-0 grid place-items-center bg-black/80 p-6">
+          <div className="max-w-sm rounded-2xl border border-(--color-edge) bg-(--color-panel) p-6 text-center">
+            <h2 className="text-2xl font-semibold text-[#f7f2ec]">
+              {hud.outcome === "won" ? "The valley is yours" : "Your hold has fallen"}
+            </h2>
+            <p className="mt-2 text-sm text-(--color-muted)">
+              {hud.outcome === "won"
+                ? `Enemy town centre destroyed in ${clock(hud.time)}.`
+                : `You lost your town centre after ${clock(hud.time)}.`}
+            </p>
+            <button
+              onClick={newGame}
+              className="mt-5 rounded-lg bg-(--color-ember) px-5 py-2.5 text-sm font-medium text-[#1a0d03] transition-opacity hover:opacity-90"
+            >
+              Play again
+            </button>
+          </div>
+        </div>
       )}
     </div>
+  );
+}
+
+function labelFor(kind: string) {
+  if (kind in UNITS) return UNITS[kind as UnitKind].name;
+  if (kind in BUILDINGS) return BUILDINGS[kind as BuildingKind].name;
+  return kind;
+}
+
+function Stat({ label, value, color }: { label: string; value: number; color: string }) {
+  return (
+    <span className="text-(--color-muted)">
+      <span style={{ color }}>{label}</span>{" "}
+      <span className="font-mono text-[#f2ece5]">{value}</span>
+    </span>
+  );
+}
+
+function Chip({
+  children,
+  sub,
+  onClick,
+  active,
+  disabled,
+}: {
+  children: React.ReactNode;
+  sub?: string;
+  onClick: () => void;
+  active?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`min-w-16 rounded-lg border px-2.5 py-1.5 text-left transition-colors ${
+        active
+          ? "border-(--color-ember) bg-[#e8873c18] text-(--color-ember)"
+          : "border-(--color-edge) text-(--color-body) hover:border-[#4a443d]"
+      } disabled:cursor-not-allowed disabled:opacity-35`}
+    >
+      <span className="block text-[12px] leading-tight whitespace-nowrap">{children}</span>
+      {sub && (
+        <span className="block font-mono text-[9px] leading-tight text-[#5f574f]">{sub}</span>
+      )}
+    </button>
   );
 }

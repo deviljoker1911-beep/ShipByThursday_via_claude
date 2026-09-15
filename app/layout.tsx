@@ -1,30 +1,36 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Galaxy — a room of AI colleagues who disagree",
+  title: "Emberhold — a small real-time strategy game",
   description:
-    "A working session with a room of AI teammates who search, run code, read repos, and hand work to each other. Runs entirely in your browser on your own API key.",
+    "Gather, build, train, fight. An original isometric RTS that runs in the browser on desktop and mobile, and installs as an app.",
+  manifest: "manifest.webmanifest",
   openGraph: {
-    title: "Galaxy — a room of AI colleagues who disagree",
-    description:
-      "A working session with a room of AI teammates. Your browser, your key, no server.",
+    title: "Emberhold",
+    description: "Gather, build, train, fight. A small RTS in your browser.",
     type: "website",
   },
 };
 
+export const viewport: Viewport = {
+  themeColor: "#14120f",
+  width: "device-width",
+  initialScale: 1,
+  // A strategy game needs both thumbs on the controls; pinch-zoom on the page
+  // itself would fight the in-game camera zoom.
+  maximumScale: 1,
+  userScalable: false,
+  viewportFit: "cover",
+};
+
 /**
- * This page holds the visitor's API key in local storage, which makes the
- * exfiltration surface the thing worth defending. `connect-src` is the
- * directive that matters: even if something hostile got onto the page, the
- * browser will refuse to send the key anywhere except Anthropic and GitHub.
- *
- * Next's hydration needs inline scripts and Tailwind emits inline styles, so
- * those stay permitted — but no external origin can load a script at all.
+ * Everything runs locally in the browser — no network calls at all once the
+ * page has loaded — so the policy can be as tight as it gets.
  */
 const CSP = [
   "default-src 'self'",
-  "connect-src 'self' https://api.anthropic.com https://api.github.com",
+  "connect-src 'self'",
   "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob:",
@@ -42,8 +48,10 @@ export default function RootLayout({
       <head>
         <meta httpEquiv="Content-Security-Policy" content={CSP} />
         <meta name="referrer" content="no-referrer" />
+        <meta name="apple-mobile-web-app-capable" content="yes" />
+        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
       </head>
-      <body className="font-sans antialiased">{children}</body>
+      <body>{children}</body>
     </html>
   );
 }

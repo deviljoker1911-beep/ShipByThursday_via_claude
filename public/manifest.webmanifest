@@ -1,0 +1,14 @@
+{
+  "name": "Emberhold",
+  "short_name": "Emberhold",
+  "description": "A small isometric real-time strategy game. Gather, build, train, fight.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "fullscreen",
+  "orientation": "landscape",
+  "background_color": "#14120f",
+  "theme_color": "#14120f",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

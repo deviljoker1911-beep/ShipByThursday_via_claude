@@ -1,5 +1,5 @@
 {
-  "name": "shipped",
+  "name": "emberhold",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,7 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "node --test lib/*.test.ts",
+    "test": "node --test game/*.test.ts",
     "build:pages": "PAGES_BASE_PATH=/ShipByThursday_via_claude next build"
   },
   "dependencies": {
