@@ -9,7 +9,8 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "node --test lib/*.test.ts"
+    "test": "node --test lib/*.test.ts",
+    "build:pages": "PAGES_BASE_PATH=/ShipByThursday_via_claude next build"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.125.0",

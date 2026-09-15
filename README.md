@@ -1,5 +1,7 @@
 # Galaxy
 
+### → [Use it](https://deviljoker1911-beep.github.io/ShipByThursday_via_claude/)
+
 **A room of AI colleagues who disagree with each other.** Built in 72 hours with
 Claude, in the open.
 
@@ -58,6 +60,26 @@ A persistent hosted desktop where a bot logs into services as a human, and
 learning a task from a screen recording. Both are infrastructure problems rather
 than orchestration problems, and neither fits in 72 hours. Saying so beats
 faking them.
+
+## Is it safe to paste a key in?
+
+Judge it from the artifact rather than the promise. The deployed site is static
+files — `next build` emits no server, so there is no backend that could receive
+a key, log a prompt, or be breached. The key is held in your browser's local
+storage and attached to requests made by your own browser.
+
+On top of that the page ships a Content Security Policy whose `connect-src`
+allows exactly two destinations. Open devtools on the live site and try it:
+
+```js
+await fetch("https://api.anthropic.com/v1/messages", { method: "POST" }) // reaches Anthropic (401)
+await fetch("https://api.github.com/repos/sveltejs/svelte")              // reaches GitHub (200)
+await fetch("https://example.org/steal", { method: "POST" })             // blocked by CSP
+```
+
+Even if something hostile reached the page, the browser refuses to send your key
+anywhere else. No external origin may load a script at all, and the referrer
+policy is `no-referrer` so keys can't leak through URLs.
 
 ## Run it
 

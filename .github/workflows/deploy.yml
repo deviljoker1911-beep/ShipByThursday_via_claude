@@ -1,0 +1,50 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only one deploy at a time; a queued run supersedes an older one rather than
+# racing it to the branch.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm test
+
+      - name: Build
+        # Pages serves this from /<repo>/, so assets need the prefix.
+        run: npm run build:pages
+
+      - name: Add .nojekyll
+        # Jekyll silently drops directories beginning with an underscore, which
+        # would strip _next entirely and serve an unstyled, scriptless page.
+        run: touch out/.nojekyll
+
+      - name: Publish to gh-pages
+        run: |
+          cd out
+          git init -q
+          git checkout -q -b gh-pages
+          git add -A
+          git -c user.email="actions@github.com" -c user.name="github-actions" \
+            commit -q -m "Deploy ${GITHUB_SHA::7}"
+          git push -q -f \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" \
+            gh-pages:gh-pages
