@@ -64,3 +64,31 @@ hard handoff cap defaulting to 6 turns.
 
 **Trade-off:** Shows an uncomfortable number, which is the point. A product that
 spends someone else's money silently should be showing them the meter.
+
+## D5 — Ship a capability check, and be explicit about what it can't tell you
+
+**Context:** "How do I know the bots allocated to these roles actually have the
+skills?" A multi-agent product is trivially easy to fake — you can name a bot
+"Engineering", give it no tools at all, and it will produce confident,
+plausible, entirely fabricated code output. That's the default failure mode, not
+an edge case.
+
+**Choice:** A Verify panel that runs live probes and shows raw evidence. Each
+probe is checked twice: **structurally** (did a tool_use block genuinely appear
+in the response?) and **factually** (does the answer match a truth we computed
+ourselves?).
+
+The factual half is the part that matters. Probes ask for values that cannot be
+produced from memory:
+- a SHA-256 digest — a model without a sandbox will emit a well-formed, wrong hash
+- a real commit sha, compared against one we fetched directly from GitHub
+- a page heading, compared against the live page
+
+**And the limit, stated in the panel itself:** none of this says whether Ada's
+business judgment is any good. A persona is a prompt, not a credential. There is
+no test for taste, and a check that implied otherwise would be worse than no
+check — it would launder a vibe into a green tick.
+
+**Trade-off:** Running the checks costs the user a few cents of real credit, and
+publishing a test your own product can fail is a risk. Both are correct: a
+capability claim nobody can test is just marketing.

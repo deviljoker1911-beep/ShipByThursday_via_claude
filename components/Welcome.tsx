@@ -31,6 +31,14 @@ export function Welcome({
         other when it isn&rsquo;t theirs.
       </p>
 
+      <p className="mt-3 max-w-lg text-[13px] leading-relaxed text-[#5f574f]">
+        Don&rsquo;t take that on faith.{" "}
+        <strong className="font-medium text-(--color-muted)">Verify</strong> in the
+        header runs live checks proving each tool genuinely executes — by asking
+        for answers no model could guess, then comparing them against
+        independently established truth.
+      </p>
+
       {hasKey ? (
         <div className="mt-8">
           <p className="mb-3 text-[11px] font-medium tracking-[0.12em] text-[#5f574f] uppercase">

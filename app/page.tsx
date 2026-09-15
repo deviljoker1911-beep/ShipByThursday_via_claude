@@ -20,6 +20,7 @@ import { SettingsPanel } from "@/components/Settings";
 import { Composer } from "@/components/Composer";
 import { BotMessage, HandoffNote, HumanMessage, ToolNote } from "@/components/Message";
 import { Welcome } from "@/components/Welcome";
+import { VerifyPanel } from "@/components/Verify";
 
 /** What's happening right now, above the committed transcript. */
 interface Live {
@@ -37,6 +38,7 @@ export default function Galaxy() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showVerify, setShowVerify] = useState(false);
   const [ready, setReady] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
@@ -220,6 +222,13 @@ export default function Galaxy() {
             </button>
           )}
           <button
+            onClick={() => setShowVerify(true)}
+            title="Prove the bots' tools actually execute"
+            className="rounded-md border border-(--color-edge) px-2 py-1 transition-colors hover:text-[#f2ece5]"
+          >
+            Verify
+          </button>
+          <button
             onClick={() => setShowSettings(true)}
             className="rounded-md border border-(--color-edge) px-2 py-1 transition-colors hover:text-[#f2ece5]"
           >
@@ -281,6 +290,16 @@ export default function Galaxy() {
             : "Add your API key in Settings to begin…"
         }
       />
+
+      {showVerify && (
+        <VerifyPanel
+          apiKey={settings.apiKey}
+          modelId={settings.modelId}
+          effort={settings.effort}
+          onClose={() => setShowVerify(false)}
+          onSpend={(usd) => setSpend((s) => s + usd)}
+        />
+      )}
 
       {showSettings && (
         <SettingsPanel

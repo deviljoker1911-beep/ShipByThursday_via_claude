@@ -116,3 +116,35 @@ and explicit permission to push back.
 The agent loop has never run against the real API — there's no key on this
 machine. Types check and the build is clean, which proves nothing about runtime.
 Handoffs, tool execution, and cost accounting are all unverified.
+
+### Verification: proving the roster isn't cosplay
+Question raised: how does anyone know the bots assigned to these roles actually
+have the skills, rather than a name and a tagline?
+
+Split the answer in two, because conflating them is how this gets faked:
+
+**Capability is testable.** Does the sandbox execute? Did search really fire?
+The Verify panel probes each one and checks it structurally (a tool_use block
+is present in the raw response — not merely described in prose) and factually
+(the answer matches something we computed independently).
+
+The factual check carries the weight. Ask a model with no sandbox for
+`sha256("ShipByThursday")` and it returns 64 well-formed hex characters that are
+wrong. Ask for the oldest commit sha in a repo and it invents one. Both look
+completely convincing. Comparing against independently-fetched truth is the only
+thing that separates executing from improvising.
+
+**Judgment is not testable.** Ada's "founder instinct" is a paragraph of prompt.
+The panel says so in its own header rather than implying a green tick means
+anything about the quality of a decision.
+
+### Still no key
+The only Anthropic credential on this machine is the OAuth session for this
+Claude Code process. Not reusing it: it's scoped to Claude Code, it's a different
+auth scheme from an API key, and repurposing it to drive a separate web app is
+the same pattern already ruled out for consumer subscriptions — with the user's
+own account as the thing at risk. Galaxy needs a key from the Console.
+
+So the ledger stands: the GitHub reader is verified against live GitHub, and
+everything touching Anthropic — handoffs, sandbox, search, fetch, cost — is
+written, typechecked, and unproven.
