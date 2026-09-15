@@ -37,6 +37,7 @@ export interface Hud {
   food: number;
   wood: number;
   gold: number;
+  stone: number;
   pop: number;
   popCap: number;
   time: number;
@@ -50,6 +51,7 @@ const EMPTY_HUD: Hud = {
   food: 0,
   wood: 0,
   gold: 0,
+  stone: 0,
   pop: 0,
   popCap: 0,
   time: 0,
@@ -99,6 +101,7 @@ export function useGame() {
       food: Math.floor(p.food),
       wood: Math.floor(p.wood),
       gold: Math.floor(p.gold),
+      stone: Math.floor(p.stone),
       pop: p.pop,
       popCap: p.popCap,
       time: world.time,

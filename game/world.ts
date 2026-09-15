@@ -3,12 +3,18 @@ import {
   CARRY_CAPACITY,
   GATHER_RATE,
   HARD_POP_CAP,
+  REPAIR_RATE,
   STARTING,
   STARTING_POP_CAP,
   UNITS,
+  attackRangeOf,
+  attackSpeedOf,
+  damageFrom,
+  isArmed,
   isBuilding,
   isUnit,
   maxHp,
+  sightOf,
 } from "./config.ts";
 import { generateMap, idx, inBounds, passable, terrainAt } from "./map.ts";
 import { findPath } from "./pathfind.ts";
@@ -21,6 +27,7 @@ import {
   type Owner,
   type Resource,
   type UnitKind,
+  type UnitState,
   type World,
 } from "./types.ts";
 
@@ -28,7 +35,16 @@ import {
 const RESOURCE_OF: Record<number, Resource | undefined> = {
   [TERRAIN_IDS.forest]: "wood",
   [TERRAIN_IDS.gold]: "gold",
-  [TERRAIN_IDS.stone]: undefined,
+  [TERRAIN_IDS.stone]: "stone",
+  [TERRAIN_IDS.forage]: "food",
+};
+
+/** Terrain that yields a given resource, for "find me more of this". */
+const TERRAIN_FOR: Record<Resource, number | null> = {
+  wood: TERRAIN_IDS.forest,
+  gold: TERRAIN_IDS.gold,
+  stone: TERRAIN_IDS.stone,
+  food: TERRAIN_IDS.forage,
 };
 
 export function createWorld(seed = Date.now()): World {
@@ -43,8 +59,10 @@ export function createWorld(seed = Date.now()): World {
     },
     nextId: 1,
     time: 0,
+    rngState: (seed ^ 0x9e3779b9) >>> 0,
     outcome: "playing",
     notices: [],
+    effects: [],
   };
 
   for (const owner of [0, 1] as Owner[]) {
@@ -85,6 +103,7 @@ export function spawn(
   if (isBuilding(kind)) {
     e.progress = progress;
     e.queue = [];
+    e.attackCd = 0;
   } else {
     e.state = { name: "idle" };
     e.attackCd = 0;
@@ -187,6 +206,66 @@ export function recomputePop(world: World) {
   }
 }
 
+/**
+ * The simulation's only source of randomness.
+ *
+ * Advances the world's stored state, so a run is reproducible from its seed.
+ */
+export function rand(world: World): number {
+  let a = (world.rngState + 0x6d2b79f5) >>> 0;
+  world.rngState = a;
+  let t = Math.imul(a ^ (a >>> 15), 1 | a);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+
+export function emit(world: World, effect: World["effects"][number]) {
+  // Presentation only. Capped so a long headless run can't grow unboundedly —
+  // the tests run thousands of ticks with no renderer draining this.
+  if (world.effects.length > 400) world.effects.shift();
+  world.effects.push(effect);
+}
+
+/**
+ * Finish the current order and start the next queued one.
+ *
+ * Shift-clicking appends to `orders`; without this a queue would silently
+ * evaporate the moment a unit completed its first task.
+ */
+export function nextOrder(world: World, e: Entity) {
+  const queued = e.orders?.shift();
+  if (!queued) {
+    e.state = { name: "idle" };
+    return;
+  }
+  applyState(world, e, queued);
+}
+
+/** Start a state, computing whatever path it needs. */
+export function applyState(world: World, e: Entity, state: UnitState) {
+  switch (state.name) {
+    case "moving":
+    case "attackMove":
+      e.state = state;
+      e.path = findPath(world.map, e.x, e.y, state.tx, state.ty, buildingBlocker(world));
+      break;
+    case "gathering":
+      commandGather(world, e, state.tileX, state.tileY);
+      break;
+    case "attacking":
+      commandAttack(world, e, state.targetId);
+      break;
+    case "building":
+      commandBuild(world, e, state.targetId);
+      break;
+    case "repairing":
+      commandRepair(world, e, state.targetId);
+      break;
+    default:
+      e.state = { name: "idle" };
+  }
+}
+
 export function notify(world: World, text: string) {
   world.notices.push({ text, at: world.time });
   if (world.notices.length > 4) world.notices.shift();
@@ -216,7 +295,8 @@ export function nearestResourceTile(
   fromY: number,
   maxRadius = 18,
 ): { x: number; y: number } | null {
-  const wanted = resource === "wood" ? TERRAIN_IDS.forest : TERRAIN_IDS.gold;
+  const wanted = TERRAIN_FOR[resource];
+  if (wanted === null) return null;
   const cx = Math.round(fromX);
   const cy = Math.round(fromY);
   for (let r = 1; r < maxRadius; r++) {
@@ -251,8 +331,46 @@ export function entityAt(world: World, tx: number, ty: number): Entity | null {
 
 export function commandMove(world: World, e: Entity, tx: number, ty: number) {
   if (!isUnit(e.kind)) return;
+  e.orders = [];
   e.state = { name: "moving", tx, ty };
   e.path = findPath(world.map, e.x, e.y, tx, ty, buildingBlocker(world));
+}
+
+/**
+ * Walk toward a point, engaging anything hostile encountered on the way.
+ *
+ * This is the command an army actually wants: a plain move order marches
+ * troops past an enemy they are standing next to, which reads as the units
+ * being broken rather than obedient.
+ */
+export function commandAttackMove(world: World, e: Entity, tx: number, ty: number) {
+  if (!isUnit(e.kind)) return;
+  e.orders = [];
+  e.state = { name: "attackMove", tx, ty };
+  e.path = findPath(world.map, e.x, e.y, tx, ty, buildingBlocker(world));
+}
+
+export function commandStop(e: Entity) {
+  if (!isUnit(e.kind)) return;
+  e.orders = [];
+  e.path = [];
+  e.state = { name: "idle" };
+}
+
+export function commandRepair(world: World, e: Entity, targetId: number) {
+  if (e.kind !== "villager") return;
+  const t = world.entities.get(targetId);
+  if (!t || !isBuilding(t.kind)) return;
+  e.state = { name: "repairing", targetId };
+  e.path = findPath(world.map, e.x, e.y, t.x, t.y, buildingBlocker(world));
+}
+
+/** Append an order instead of replacing the current one (shift-click). */
+export function queueOrder(world: World, e: Entity, state: UnitState) {
+  if (!isUnit(e.kind)) return;
+  if (!e.orders) e.orders = [];
+  if (e.state?.name === "idle") applyState(world, e, state);
+  else e.orders.push(state);
 }
 
 export function commandGather(world: World, e: Entity, tileX: number, tileY: number) {
@@ -306,6 +424,7 @@ export function tick(world: World, dt: number) {
 
   separate(world);
   recomputePop(world);
+  world.effects = world.effects.filter((fx) => world.time - fx.t < fx.life);
   checkOutcome(world);
 }
 
@@ -314,6 +433,17 @@ function tickBuilding(world: World, e: Entity, dt: number) {
 
   if (spec.foodPerSecond && e.progress === 1) {
     world.players[e.owner].food += spec.foodPerSecond * dt;
+  }
+
+  // Defensive buildings engage on their own — a tower that needed orders
+  // would be a worse house.
+  if (e.progress === 1 && isArmed(e.kind)) {
+    e.attackCd = Math.max(0, (e.attackCd ?? 0) - dt);
+    const foe = nearestEnemy(world, e, attackRangeOf(e.kind));
+    if (foe && e.attackCd === 0) {
+      e.attackCd = attackSpeedOf(e.kind);
+      strike(world, e, foe);
+    }
   }
 
   if (e.progress !== 1 || !e.queue?.length) return;
@@ -375,11 +505,15 @@ function tickUnit(world: World, e: Entity, dt: number) {
 
   switch (state.name) {
     case "idle":
-      autoAcquire(world, e, spec.range);
+      if (e.orders?.length) {
+        nextOrder(world, e);
+        break;
+      }
+      autoAcquire(world, e, spec.sight);
       break;
 
     case "moving":
-      if (stepAlongPath(world, e, spec.speed, dt)) e.state = { name: "idle" };
+      if (stepAlongPath(world, e, spec.speed, dt)) nextOrder(world, e);
       break;
 
     case "gathering": {
@@ -476,11 +610,16 @@ function tickUnit(world: World, e: Entity, dt: number) {
     case "building": {
       const target = world.entities.get(state.targetId);
       if (!target || target.progress === 1) {
-        e.state = { name: "idle" };
+        nextOrder(world, e);
         break;
       }
       if (distanceTo(target, e.x, e.y) > 1.2) {
-        stepAlongPath(world, e, spec.speed, dt);
+        // Same failure mode as gathering: if the path runs out and we are
+        // still short, standing here achieves nothing and the site is never
+        // finished. Give up so whoever issued the order can reassign.
+        if (stepAlongPath(world, e, spec.speed, dt) && distanceTo(target, e.x, e.y) > 1.2) {
+          nextOrder(world, e);
+        }
         break;
       }
       e.path = [];
@@ -489,7 +628,7 @@ function tickUnit(world: World, e: Entity, dt: number) {
       target.hp = spec2.hp * (0.15 + 0.85 * target.progress);
       if (target.progress >= 1) {
         target.hp = spec2.hp;
-        e.state = { name: "idle" };
+        nextOrder(world, e);
       }
       break;
     }
@@ -497,10 +636,10 @@ function tickUnit(world: World, e: Entity, dt: number) {
     case "attacking": {
       const target = world.entities.get(state.targetId);
       if (!target) {
-        e.state = { name: "idle" };
+        nextOrder(world, e);
         break;
       }
-      const reach = spec.range;
+      const reach = attackRangeOf(e.kind);
       const d = distanceTo(target, e.x, e.y);
       if (d > reach) {
         if (!e.path?.length) {
@@ -512,22 +651,100 @@ function tickUnit(world: World, e: Entity, dt: number) {
       e.path = [];
       if (e.attackCd! > 0) break;
       e.attackCd = spec.attackSpeed;
-      target.hp -= spec.attack;
-      if (target.hp <= 0) {
-        world.entities.delete(target.id);
-        e.state = { name: "idle" };
+      strike(world, e, target);
+      if (target.hp <= 0) nextOrder(world, e);
+      break;
+    }
+
+    case "repairing": {
+      const target = world.entities.get(state.targetId);
+      if (!target || !isBuilding(target.kind)) {
+        nextOrder(world, e);
+        break;
       }
+      const full = maxHp(target.kind);
+      if (target.hp >= full) {
+        nextOrder(world, e);
+        break;
+      }
+      if (distanceTo(target, e.x, e.y) > 1.2) {
+        if (!e.path?.length) {
+          e.path = findPath(world.map, e.x, e.y, target.x, target.y, buildingBlocker(world));
+        }
+        if (stepAlongPath(world, e, spec.speed, dt) && distanceTo(target, e.x, e.y) > 1.2) {
+          nextOrder(world, e);
+        }
+        break;
+      }
+      e.path = [];
+      const rate = full / BUILDINGS[target.kind as BuildingKind].buildTime;
+      target.hp = Math.min(full, target.hp + rate * REPAIR_RATE * dt);
+      break;
+    }
+
+    case "attackMove": {
+      // Engage anything hostile within sight; otherwise keep marching.
+      const foe = nearestEnemy(world, e, spec.sight);
+      if (foe) {
+        // Remember the destination so the unit resumes after the fight.
+        e.orders = [{ name: "attackMove", tx: state.tx, ty: state.ty }, ...(e.orders ?? [])];
+        commandAttackKeepQueue(world, e, foe.id);
+        break;
+      }
+      if (stepAlongPath(world, e, spec.speed, dt)) nextOrder(world, e);
       break;
     }
   }
 }
 
-/** Idle military units defend themselves rather than being shot at passively. */
-function autoAcquire(world: World, e: Entity, range: number) {
-  if (e.kind === "villager") return;
-  const searchRange = Math.max(range, 5);
+/**
+ * Resolve one attack, including counters and armour.
+ *
+ * Ranged attackers emit a projectile the renderer animates; the damage is
+ * applied immediately regardless, so the simulation stays deterministic and
+ * independent of whether anything is drawing.
+ */
+function strike(world: World, attacker: Entity, target: Entity) {
+  const range = attackRangeOf(attacker.kind);
+  if (range > 2) {
+    emit(world, {
+      kind: "projectile",
+      x: attacker.x,
+      y: attacker.y,
+      tx: target.x,
+      ty: target.y,
+      t: world.time,
+      life: 0.28,
+      owner: attacker.owner,
+    });
+  }
+  target.hp -= damageFrom(attacker.kind, target.kind);
+  emit(world, { kind: "impact", x: target.x, y: target.y, t: world.time, life: 0.22 });
+
+  if (target.hp <= 0) {
+    emit(world, {
+      kind: "death",
+      x: target.x,
+      y: target.y,
+      t: world.time,
+      life: 0.6,
+      owner: target.owner,
+    });
+    world.entities.delete(target.id);
+  }
+}
+
+/** Attack without clearing the order queue, so attack-move can resume. */
+function commandAttackKeepQueue(world: World, e: Entity, targetId: number) {
+  e.state = { name: "attacking", targetId };
+  const t = world.entities.get(targetId);
+  if (t) e.path = findPath(world.map, e.x, e.y, t.x, t.y, buildingBlocker(world));
+}
+
+/** Closest hostile entity within `range`, measured to its edge. */
+export function nearestEnemy(world: World, e: Entity, range: number): Entity | null {
   let best: Entity | null = null;
-  let bestD = searchRange;
+  let bestD = range;
   for (const other of world.entities.values()) {
     if (other.owner === e.owner) continue;
     const d = distanceTo(other, e.x, e.y);
@@ -536,7 +753,19 @@ function autoAcquire(world: World, e: Entity, range: number) {
       best = other;
     }
   }
-  if (best) e.state = { name: "attacking", targetId: best.id };
+  return best;
+}
+
+/**
+ * Idle military units defend themselves rather than being shot at passively.
+ *
+ * Villagers and scouts are excluded: a villager that charges a raiding party
+ * is a villager you have lost, and a scout that stops to fight stops scouting.
+ */
+function autoAcquire(world: World, e: Entity, range: number) {
+  if (e.kind === "villager" || e.kind === "scout") return;
+  const foe = nearestEnemy(world, e, Math.max(range, 5));
+  if (foe) e.state = { name: "attacking", targetId: foe.id };
 }
 
 /**

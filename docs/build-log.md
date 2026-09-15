@@ -197,3 +197,88 @@ checked across 40 seeds, because both freezes only appeared on particular
 terrain and a single lucky seed proves nothing.
 
 What this cannot tell me is whether the game is any fun. That needs hands on it.
+
+## Day 2 — Wednesday, Sept 16, 2026
+
+### Phase 1: making the match strategically coherent
+Audited first rather than polishing. The audit found dead and missing systems,
+not cosmetic gaps, so none of this turn went on visuals.
+
+**Stone was dead content.** `RESOURCE_OF[stone]` was `undefined` while stone
+deposits were generated *and drawn on screen* — the player could see a resource
+they could never collect. Now gathered, and it is what watchtowers cost.
+
+**Food had no source at all.** `TERRAIN_FOR.food` was `null`; food came only
+from farms, while villagers cost 50 food each. Measured over a match, both
+economies flatlined at 10 and 8 villagers for five straight minutes. Added
+forage bushes, guaranteed near every start. Villagers now reach 15 by minute 2.
+
+**Combat had no strategy in it.** `target.hp -= spec.attack` — flat damage, no
+armour, no counters. Added an armour-class system and a counter triangle:
+spearmen beat riders, riders beat archers, archers beat spearmen. Bonuses are
+large enough to decide a fight, because a counter the player cannot feel is a
+rounding error.
+
+**Buildings were unkillable.** A spearman's 8 damage against a town centre with
+armour 6 did 2 per swing — roughly 550 swings for one building. No match could
+ever end. Armour rebalanced, and melee units got a bonus against structures
+while archers did not, which is a reason to mix an army.
+
+### The bug that made the whole game pointless
+Matches never resolved, on any seed, even at 60 simulated minutes. Four rounds
+of plausible-looking guesses (target priority, wave timing, defence triggers)
+each made it slightly different and none fixed it. Measuring instead of guessing
+found it in one shot: town centre HP never moved from full, and no attacker ever
+came within eight tiles of one.
+
+Cross-map pathfinding was returning paths that **gave up 22 to 38 tiles short**,
+in under a millisecond — A* exhausting its frontier. Forests are impassable and
+dense enough to carve the map into disconnected pockets, so on most seeds the
+two bases simply could not reach each other. Every match was two players farming
+in separate sealed rooms.
+
+Fixed by carving lanes between the bases — one wide central road and two
+narrower flanking passes — with a connectivity check and a forced corridor as a
+backstop. That also delivered what §16 asked for: the narrow flanks are
+defensible and the centre is contested, so the map creates strategic decisions
+through geography rather than through a menu.
+
+There is a test for it now, across 60 seeds. It is exactly the class of bug that
+is invisible in a screenshot and obvious in a measurement.
+
+### Two more freezes of the familiar shape
+The construction branch had no arrival fallback, so a builder whose path ran out
+just short waited forever. When the stuck site was a house, the population cap
+never rose and the entire economy stopped behind it. The AI also placed sites it
+had no villagers to staff, paying for buildings that sat at 1% permanently.
+
+That is now the fourth bug of this shape in this codebase. The rule, written
+down properly this time: **any "am I close enough?" threshold measured against
+an entity's centre is a freeze waiting for the right geometry, and every
+approach branch needs a give-up path.**
+
+### What the AI does now
+It scouts, defends, repairs, rebuilds, staffs its own construction, balances
+gathering against what it is short of, and picks units that answer what it has
+seen. It cheats at nothing. Two honest findings from tuning it:
+
+- **Flanking routes made matches worse.** Splitting the approach added travel
+  time and weakened every push; resolution fell from 4 seeds in 8 to 2. Reverted.
+- **Raiding the economy is what ends matches.** Straight pushes produce an
+  equilibrium — both sides lose armies at equal rates and rebuild from untouched
+  economies. Killing villagers is the only damage an opponent cannot replace at
+  full speed. With raids on two waves in three, 5 of 6 seeds now resolve, most
+  in 10 to 19 minutes.
+
+### Determinism
+The AI was calling `Math.random()`, so the same seed did not replay the same
+match. RNG state now lives on the world as a plain number — serialisable, so a
+match can be replayed from its seed. That is what makes a bug reproducible and
+is the precondition for any future lockstep networking.
+
+### Tests
+28 headless tests, up from 14. They cover the counter triangle in a real fight,
+armour never making anything invulnerable, every resource actually reaching the
+stockpile, towers defending themselves, attack-move engaging en route, order
+queues, repair, map connectivity across 60 seeds, and complete matches played
+out by the AI on both sides.

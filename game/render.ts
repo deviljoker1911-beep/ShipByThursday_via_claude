@@ -19,6 +19,7 @@ const COLORS = {
   gold: ["#8a6d2f", "#a07f38"],
   water: ["#2a4a63", "#31566f"],
   stone: ["#5c5b56", "#6a6963"],
+  forage: ["#4f6b36", "#58763d"],
 } as const;
 
 const PLAYER_COLORS: Record<number, { body: string; trim: string }> = {
@@ -31,6 +32,7 @@ function terrainName(id: number): keyof typeof COLORS {
   if (id === TERRAIN_IDS.gold) return "gold";
   if (id === TERRAIN_IDS.water) return "water";
   if (id === TERRAIN_IDS.stone) return "stone";
+  if (id === TERRAIN_IDS.forage) return "forage";
   return "grass";
 }
 
@@ -119,8 +121,10 @@ function drawTerrain(
         drawTree(ctx, sx, sy, cam.zoom);
       } else if (name === "gold" && map.amount[idx(map, x, y)] > 0) {
         drawOre(ctx, sx, sy, cam.zoom, "#e8c46a");
-      } else if (name === "stone") {
+      } else if (name === "stone" && map.amount[idx(map, x, y)] > 0) {
         drawOre(ctx, sx, sy, cam.zoom, "#9d9c96");
+      } else if (name === "forage" && map.amount[idx(map, x, y)] > 0) {
+        drawBush(ctx, sx, sy, cam.zoom);
       }
     }
   }
@@ -144,6 +148,25 @@ function drawTree(ctx: CanvasRenderingContext2D, sx: number, sy: number, zoom: n
   ctx.lineTo(sx - 6.5 * zoom, sy - h * 0.55);
   ctx.closePath();
   ctx.fill();
+}
+
+/** Forage bushes — the early food supply, and the only red on the map. */
+function drawBush(ctx: CanvasRenderingContext2D, sx: number, sy: number, zoom: number) {
+  ctx.fillStyle = "#35542c";
+  ctx.beginPath();
+  ctx.ellipse(sx, sy - 4 * zoom, 9 * zoom, 6 * zoom, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = "#c2472f";
+  for (const [dx, dy] of [
+    [-4, -5],
+    [2, -7],
+    [4, -3],
+    [-1, -2],
+  ] as const) {
+    ctx.beginPath();
+    ctx.arc(sx + dx * zoom, sy + dy * zoom, 1.7 * zoom, 0, Math.PI * 2);
+    ctx.fill();
+  }
 }
 
 function drawOre(
@@ -242,7 +265,16 @@ function drawBuilding(
 
   const hw = (TILE_W / 2) * size * z;
   const hh = (TILE_H / 2) * size * z;
-  const wallH = (e.kind === "house" ? 22 : e.kind === "farm" ? 4 : 34) * z;
+  const wallH =
+    (e.kind === "farm"
+      ? 4
+      : e.kind === "house"
+        ? 22
+        : e.kind === "storehouse"
+          ? 24
+          : e.kind === "tower"
+            ? 52 // tall and narrow, so it reads as a tower at a glance
+            : 34) * z;
   const progress = e.progress ?? 1;
 
   if (selected) {

@@ -1,11 +1,17 @@
 /** Core model. Tile coordinates are floats; units move smoothly between tiles. */
 
-export type Terrain = "grass" | "forest" | "gold" | "water" | "stone";
+export type Terrain = "grass" | "forest" | "gold" | "water" | "stone" | "forage";
 
-export type Resource = "food" | "wood" | "gold";
+export type Resource = "food" | "wood" | "gold" | "stone";
 
-export type UnitKind = "villager" | "spearman" | "archer";
-export type BuildingKind = "towncenter" | "house" | "barracks" | "farm";
+export type UnitKind = "villager" | "spearman" | "archer" | "rider" | "scout";
+export type BuildingKind =
+  | "towncenter"
+  | "house"
+  | "barracks"
+  | "farm"
+  | "storehouse"
+  | "tower";
 export type EntityKind = UnitKind | BuildingKind;
 
 /** 0 is the human player, 1 is the AI. */
@@ -17,6 +23,9 @@ export type UnitState =
   | { name: "gathering"; tileX: number; tileY: number; resource: Resource }
   | { name: "returning"; resource: Resource }
   | { name: "building"; targetId: number }
+  | { name: "repairing"; targetId: number }
+  /** Walk to a point, but stop and engage anything hostile on the way. */
+  | { name: "attackMove"; tx: number; ty: number }
   | { name: "attacking"; targetId: number };
 
 export interface Entity {
@@ -40,6 +49,8 @@ export interface Entity {
   queue?: { kind: UnitKind; remaining: number }[];
   /** Rally point for trained units (buildings). */
   rally?: { x: number; y: number };
+  /** Queued follow-up orders (shift-click). */
+  orders?: UnitState[];
   /** Tile a villager was gathering from, so it can resume after banking. */
   workTile?: { x: number; y: number };
 }
@@ -49,6 +60,7 @@ export interface Player {
   food: number;
   wood: number;
   gold: number;
+  stone: number;
   /** Population currently used and the cap from houses. */
   pop: number;
   popCap: number;
@@ -70,10 +82,33 @@ export interface World {
   nextId: number;
   /** Seconds since the match began. */
   time: number;
+  /**
+   * Seeded RNG state for everything inside the simulation.
+   *
+   * Held as a plain number rather than a closure so a world can be
+   * serialised — and so the same seed replays exactly, which is what makes a
+   * bug reproducible and is the precondition for replays or lockstep play.
+   * Nothing in the simulation may call Math.random().
+   */
+  rngState: number;
   outcome: "playing" | "won" | "lost";
   /** Transient notices for the HUD. */
   notices: { text: string; at: number }[];
+  /** Short-lived visual events the renderer consumes; never read by the sim. */
+  effects: Effect[];
 }
+
+/**
+ * Presentation-only events.
+ *
+ * The simulation emits these and never reads them back, so the renderer stays
+ * a pure consumer of state and the rules remain testable headlessly.
+ */
+export type Effect =
+  | { kind: "projectile"; x: number; y: number; tx: number; ty: number; t: number; life: number; owner: Owner }
+  | { kind: "impact"; x: number; y: number; t: number; life: number }
+  | { kind: "marker"; x: number; y: number; t: number; life: number; hostile: boolean }
+  | { kind: "death"; x: number; y: number; t: number; life: number; owner: Owner };
 
 export const TERRAIN_IDS: Record<Terrain, number> = {
   grass: 0,
@@ -81,6 +116,14 @@ export const TERRAIN_IDS: Record<Terrain, number> = {
   gold: 2,
   water: 3,
   stone: 4,
+  forage: 5,
 };
 
-export const TERRAIN_BY_ID: Terrain[] = ["grass", "forest", "gold", "water", "stone"];
+export const TERRAIN_BY_ID: Terrain[] = [
+  "grass",
+  "forest",
+  "gold",
+  "water",
+  "stone",
+  "forage",
+];

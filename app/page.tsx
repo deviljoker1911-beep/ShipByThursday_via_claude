@@ -4,7 +4,14 @@ import { BUILDINGS, UNITS } from "@/game/config";
 import { useGame } from "@/game/useGame";
 import type { BuildingKind, UnitKind } from "@/game/types";
 
-const BUILD_ORDER: BuildingKind[] = ["house", "farm", "barracks", "towncenter"];
+const BUILD_ORDER: BuildingKind[] = [
+  "house",
+  "farm",
+  "storehouse",
+  "barracks",
+  "tower",
+  "towncenter",
+];
 
 function cost(c: Partial<Record<string, number>>) {
   return Object.entries(c)
@@ -48,6 +55,7 @@ export default function Page() {
         <Stat label="Food" value={hud.food} color="#e0705a" />
         <Stat label="Wood" value={hud.wood} color="#b08050" />
         <Stat label="Gold" value={hud.gold} color="#e8c46a" />
+        <Stat label="Stone" value={hud.stone} color="#b9b7b0" />
         <span className={capped ? "text-[#e0705a]" : "text-(--color-muted)"}>
           Pop <span className="font-mono text-[#f2ece5]">{hud.pop}/{hud.popCap}</span>
         </span>
