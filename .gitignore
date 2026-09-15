@@ -6,3 +6,5 @@ dist/
 build/
 .next/
 *.log
+out/
+.vercel
