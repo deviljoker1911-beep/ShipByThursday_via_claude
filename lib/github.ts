@@ -9,6 +9,17 @@
 
 const API = "https://api.github.com";
 
+/**
+ * Optional, user-supplied. Anonymous GitHub requests are capped at 60/hour per
+ * IP; a token raises that to 5,000. Set from the browser, never persisted
+ * anywhere but the user's own machine.
+ */
+let githubToken: string | null = null;
+
+export function setGitHubToken(token: string | null) {
+  githubToken = token?.trim() || null;
+}
+
 export class GitHubError extends Error {
   readonly status: number;
 
@@ -98,10 +109,9 @@ function headers(): HeadersInit {
   const h: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "shipped-by-thursday",
-  };
-  if (process.env.GITHUB_TOKEN) {
-    h.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+      };
+  if (githubToken) {
+    h.Authorization = `Bearer ${githubToken}`;
   }
   return h;
 }
@@ -116,7 +126,7 @@ async function gh(path: string): Promise<Response> {
 
   if (res.status === 404) {
     throw new GitHubError(
-      "Repo not found. It may be private, renamed, or misspelled — Shipped only reads public repos.",
+      "Repo not found. It may be private, renamed, or misspelled — only public repos can be read.",
       404,
     );
   }
@@ -129,9 +139,9 @@ async function gh(path: string): Promise<Response> {
       const reset = Number(res.headers.get("x-ratelimit-reset") ?? 0) * 1000;
       const mins = Math.max(1, Math.ceil((reset - Date.now()) / 60000));
       throw new GitHubError(
-        process.env.GITHUB_TOKEN
+        githubToken
           ? `GitHub rate limit reached. Resets in about ${mins} minute${mins === 1 ? "" : "s"}.`
-          : "GitHub rate limit reached. Set GITHUB_TOKEN in your environment to raise the limit from 60/hour to 5,000/hour.",
+          : "GitHub rate limit reached. Add a GitHub token in Settings to raise the limit from 60/hour to 5,000/hour.",
         429,
       );
     }
@@ -312,4 +322,49 @@ export async function fetchHistory(input: string): Promise<RepoHistory> {
     totalCommits: total,
     sampled,
   };
+}
+
+function fmtDate(iso: string): string {
+  return iso ? iso.slice(0, 10) : "unknown";
+}
+
+/** Render a fetched history into compact text a model can read. */
+export function buildDigest(history: RepoHistory): string {
+  const { meta, commits, tags, totalCommits, sampled } = history;
+  const lines: string[] = [];
+
+  lines.push(`REPOSITORY: ${meta.fullName}`);
+  if (meta.description) lines.push(`Description: ${meta.description}`);
+  if (meta.isFork) lines.push(`Note: this repository is a fork.`);
+  lines.push(`Created: ${fmtDate(meta.createdAt)}   Last push: ${fmtDate(meta.pushedAt)}`);
+  if (meta.language) {
+    const others = meta.languages.filter((l) => l !== meta.language);
+    lines.push(
+      `Primary language: ${meta.language}` +
+        (others.length ? `   (also: ${others.join(", ")})` : ""),
+    );
+  }
+  if (meta.topics.length) lines.push(`Topics: ${meta.topics.join(", ")}`);
+  lines.push(
+    `Stars: ${meta.stars.toLocaleString()}   Forks: ${meta.forks.toLocaleString()}` +
+      (meta.license ? `   License: ${meta.license}` : ""),
+  );
+  lines.push(`Total commits on ${meta.defaultBranch}: ${totalCommits.toLocaleString()}`);
+
+  lines.push(
+    sampled
+      ? `\nIMPORTANT: The ${commits.length} commits below are a SAMPLE spread evenly across all ${totalCommits.toLocaleString()} commits — they are not consecutive. Gaps between them are sampling artifacts, NOT periods of inactivity.`
+      : `\nThe ${commits.length} commits below are the complete history.`,
+  );
+
+  if (tags.length) {
+    lines.push(`\nRELEASE TAGS (newest first): ${tags.map((t) => t.name).join(", ")}`);
+  }
+
+  lines.push(`\nCOMMITS (newest first — sha, date, author, subject):`);
+  for (const c of commits) {
+    lines.push(`${c.sha}  ${fmtDate(c.date)}  ${c.author}  ${c.message}`);
+  }
+
+  return lines.join("\n");
 }

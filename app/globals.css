@@ -35,61 +35,44 @@ body::before {
   z-index: 0;
 }
 
-/* The generated story. Styled here rather than with per-element Tailwind
-   classes because the markdown renderer emits plain tags. */
-.story {
-  font-family: var(--font-story);
-  font-size: 1.0625rem;
-  line-height: 1.7;
+/* Bot messages. Markdown renders plain tags, so they're styled here. */
+.chat {
+  font-size: 0.9375rem;
+  line-height: 1.65;
   color: #ded7cf;
 }
-.story > p:first-child {
-  font-size: 1.1875rem;
-  line-height: 1.65;
-  color: #efe9e2;
+.chat > *:first-child {
+  margin-top: 0;
 }
-.story h2 {
-  font-family: ui-sans-serif, system-ui, sans-serif;
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--color-ember);
-  margin: 2.75rem 0 1.25rem;
-  padding-top: 1.5rem;
-  border-top: 1px solid var(--color-edge);
+.chat > *:last-child {
+  margin-bottom: 0;
 }
-.story h3 {
-  font-family: ui-sans-serif, system-ui, sans-serif;
-  font-size: 1.0625rem;
+.chat p {
+  margin: 0 0 0.75rem;
+}
+.chat ul,
+.chat ol {
+  margin: 0 0 0.75rem;
+  padding-left: 1.25rem;
+}
+.chat li {
+  margin-bottom: 0.3rem;
+}
+.chat ul {
+  list-style: disc;
+}
+.chat ol {
+  list-style: decimal;
+}
+.chat h1,
+.chat h2,
+.chat h3 {
+  font-size: 0.9375rem;
   font-weight: 600;
   color: #f2ece5;
-  margin: 2rem 0 0.625rem;
+  margin: 1.25rem 0 0.5rem;
 }
-.story p {
-  margin: 0 0 1.125rem;
-}
-.story ul {
-  margin: 0 0 1.125rem;
-  padding-left: 1.125rem;
-  list-style: none;
-}
-.story li {
-  position: relative;
-  margin-bottom: 0.75rem;
-}
-.story li::before {
-  content: "";
-  position: absolute;
-  left: -1.125rem;
-  top: 0.7em;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--color-ember);
-  opacity: 0.55;
-}
-.story code {
+.chat code {
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 0.8125em;
   background: rgba(232, 135, 60, 0.11);
@@ -97,24 +80,44 @@ body::before {
   padding: 0.15em 0.4em;
   border-radius: 4px;
 }
-.story strong {
+.chat pre {
+  background: #0a0908;
+  border: 1px solid var(--color-edge);
+  border-radius: 8px;
+  padding: 0.875rem;
+  overflow-x: auto;
+  margin: 0 0 0.75rem;
+}
+.chat pre code {
+  background: none;
+  color: #ded7cf;
+  padding: 0;
+  font-size: 0.8125rem;
+}
+.chat strong {
   color: #f7f2ec;
   font-weight: 600;
 }
-.story a {
+.chat a {
   color: var(--color-ember);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
-.story hr {
-  border: 0;
-  border-top: 1px solid var(--color-edge);
-  margin: 2rem 0;
+.chat table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0 0 0.75rem;
+  font-size: 0.875rem;
+}
+.chat th,
+.chat td {
+  border: 1px solid var(--color-edge);
+  padding: 0.4rem 0.6rem;
+  text-align: left;
 }
 
-/* Blinking cursor while text is still streaming in. */
-.story-streaming > :last-child::after {
-  content: "▍";
+.chat-streaming > :last-child::after {
+  content: "\u258D";
   color: var(--color-ember);
   margin-left: 2px;
   animation: blink 1.1s steps(2, start) infinite;
@@ -126,7 +129,7 @@ body::before {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .story-streaming > :last-child::after {
+  .chat-streaming > :last-child::after {
     animation: none;
   }
 }

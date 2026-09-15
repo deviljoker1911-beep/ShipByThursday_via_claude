@@ -70,3 +70,49 @@ be run outside a bundler — worth avoiding in any file you might want to test
 directly.
 
 Verified: mobile at 375px, production build, typecheck, 3 test files passing.
+
+## Day 1 (cont.) — Tuesday, Sept 15, 2026
+
+### Pivot: Shipped → Galaxy
+Direction changed. Instead of a tool *about* build stories, build an
+open-source take on the Grok Bot product being demoed on the stream: a room of
+AI teammates who use tools and hand work to each other.
+
+Shipped isn't deleted — its GitHub reader became a bot tool. Kai (engineering)
+can read a repository's commit history mid-conversation. Day 1's product became
+Day 2's feature, which is the most honest outcome a pivot can have.
+
+### The thing that made this buildable in a day
+Grok Bot's headline capabilities are "browses the web, runs code, works with
+files". The obvious reading is that you need a VM fleet. You don't: Anthropic's
+API ships `web_search`, `web_fetch` and `code_execution` as **server-side**
+tools, executed on Anthropic's infrastructure inside a real container. The
+client declares them and reads the results. That removes essentially all the
+infrastructure from the problem.
+
+What genuinely can't be done this way — a persistent desktop a bot logs into
+services on, and teach-a-task from a screen recording — is documented as out of
+scope rather than faked.
+
+### A conflict worth knowing about
+The 2026 web tools (`web_search_20260209`) run code execution internally for
+dynamic filtering, so declaring `code_execution` alongside them puts two
+execution environments in front of the model. Kai needs a real sandbox, so Kai
+gets the basic web tool variants instead; the other bots get the modern ones.
+`toolsFor()` in `lib/agent.ts` makes that choice per bot.
+
+### Design notes
+The transcript is stored as plain text turns, not API message objects. Each
+bot's view is rebuilt from it every turn — its own turns become `assistant`,
+everyone else's become `user` with a speaker prefix. That makes handoffs
+almost free: when a bot passes work on, its in-flight message list is simply
+dropped, because nothing downstream depends on it.
+
+Personas are written to disagree. A room where every bot concurs is one bot with
+extra API calls, so each has a distinct remit, a named failure mode to avoid,
+and explicit permission to push back.
+
+### Not yet verified
+The agent loop has never run against the real API — there's no key on this
+machine. Types check and the build is clean, which proves nothing about runtime.
+Handoffs, tool execution, and cost accounting are all unverified.

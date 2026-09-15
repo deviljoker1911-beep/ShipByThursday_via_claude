@@ -1,217 +1,295 @@
 "use client";
 
-import { useRef, useState } from "react";
-import Markdown from "react-markdown";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { runRoom, type Turn } from "@/lib/agent";
+import { getBot } from "@/lib/bots";
+import { setGitHubToken } from "@/lib/github";
+import { estimateCost, formatCost, ZERO_USAGE, type Usage } from "@/lib/models";
+import {
+  DEFAULT_SETTINGS,
+  clearAll,
+  loadSettings,
+  loadSpend,
+  loadTranscript,
+  saveSettings,
+  saveSpend,
+  saveTranscript,
+  type Settings,
+} from "@/lib/storage";
+import { SettingsPanel } from "@/components/Settings";
+import { Composer } from "@/components/Composer";
+import { BotMessage, HandoffNote, HumanMessage, ToolNote } from "@/components/Message";
+import { Welcome } from "@/components/Welcome";
 
-interface StoryMeta {
-  fullName: string;
-  totalCommits: number;
-  sampledCommits: number;
-  sampled: boolean;
-  createdAt: string;
-  stars: number;
+/** What's happening right now, above the committed transcript. */
+interface Live {
+  botId: string;
+  text: string;
+  tool: string | null;
 }
 
-const EXAMPLES = [
-  "deviljoker1911-beep/ShipByThursday_via_claude",
-  "sveltejs/svelte",
-  "ziglang/zig",
-  "tailwindlabs/tailwindcss",
-];
-
-export default function Home() {
-  const [repo, setRepo] = useState("");
-  const [story, setStory] = useState("");
-  const [meta, setMeta] = useState<StoryMeta | null>(null);
-  const [error, setError] = useState<string | null>(null);
+export default function Galaxy() {
+  const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
+  const [transcript, setTranscript] = useState<Turn[]>([]);
+  const [live, setLive] = useState<Live | null>(null);
+  const [spend, setSpend] = useState(0);
+  const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [ready, setReady] = useState(false);
+
   const abortRef = useRef<AbortController | null>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
 
-  async function run(target: string) {
-    const value = target.trim();
-    if (!value || busy) return;
+  // Hydrate from the browser after mount — localStorage doesn't exist during SSR.
+  useEffect(() => {
+    const s = loadSettings();
+    setSettings(s);
+    setTranscript(loadTranscript());
+    setSpend(loadSpend());
+    setGitHubToken(s.githubToken || null);
+    setReady(true);
+  }, []);
 
+  useEffect(() => {
+    if (ready) saveSettings(settings);
+    setGitHubToken(settings.githubToken || null);
+  }, [settings, ready]);
+
+  useEffect(() => {
+    if (ready) saveTranscript(transcript);
+  }, [transcript, ready]);
+
+  useEffect(() => {
+    if (ready) saveSpend(spend);
+  }, [spend, ready]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [transcript, live]);
+
+  const stop = useCallback(() => {
     abortRef.current?.abort();
+    abortRef.current = null;
+    setBusy(false);
+    setLive(null);
+  }, []);
+
+  const send = useCallback(async () => {
+    const text = input.trim();
+    if (!text || busy) return;
+    if (!settings.apiKey.trim()) {
+      setShowSettings(true);
+      return;
+    }
+
+    setError(null);
+    setInput("");
+
+    const withHuman: Turn[] = [...transcript, { kind: "human", text }];
+    setTranscript(withHuman);
+    setBusy(true);
+
     const controller = new AbortController();
     abortRef.current = controller;
 
-    setBusy(true);
-    setError(null);
-    setStory("");
-    setMeta(null);
+    // The room opens with whoever is listed first, and afterwards whoever last
+    // held the floor picks it back up.
+    const lastSpeaker = [...withHuman]
+      .reverse()
+      .find((t): t is Extract<Turn, { kind: "bot" }> => t.kind === "bot");
+    const startBotId =
+      lastSpeaker && settings.roster.includes(lastSpeaker.botId)
+        ? lastSpeaker.botId
+        : settings.roster[0];
+
+    // Accumulates locally: React state updates are async, and a handoff can
+    // fire several times before a render lands.
+    let working = withHuman;
+    let turnUsage: Usage = ZERO_USAGE;
 
     try {
-      const res = await fetch("/api/story", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repo: value }),
+      for await (const event of runRoom({
+        apiKey: settings.apiKey.trim(),
+        modelId: settings.modelId,
+        effort: settings.effort,
+        roster: settings.roster,
+        transcript: withHuman,
+        startBotId,
+        maxBotTurns: settings.maxBotTurns,
         signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        setError(body?.error ?? `Request failed (${res.status}).`);
-        return;
-      }
-      if (!res.body) {
-        setError("The server sent an empty response.");
-        return;
-      }
-
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let headerParsed = false;
-
-      for (;;) {
-        const { done, value: chunk } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(chunk, { stream: true });
-
-        // The first line is a JSON header; everything after it is story text.
-        if (!headerParsed) {
-          const newline = buffer.indexOf("\n");
-          if (newline === -1) continue;
-          try {
-            setMeta(JSON.parse(buffer.slice(0, newline)) as StoryMeta);
-          } catch {
-            // Non-fatal: we just don't show the stats bar.
-          }
-          buffer = buffer.slice(newline + 1);
-          headerParsed = true;
+      })) {
+        switch (event.type) {
+          case "bot_start":
+            setLive({ botId: event.botId, text: "", tool: null });
+            break;
+          case "text":
+            setLive((l) =>
+              l ? { ...l, text: l.text + event.delta, tool: null } : l,
+            );
+            break;
+          case "tool":
+            setLive((l) => (l ? { ...l, tool: event.detail } : l));
+            break;
+          case "bot_end":
+            if (event.text) {
+              working = [...working, { kind: "bot", botId: event.botId, text: event.text }];
+              setTranscript(working);
+            }
+            setLive(null);
+            break;
+          case "handoff":
+            working = [
+              ...working,
+              { kind: "handoff", from: event.from, to: event.to, brief: event.brief },
+            ];
+            setTranscript(working);
+            break;
+          case "usage":
+            turnUsage = event.usage;
+            break;
+          case "error":
+            setError(event.message);
+            break;
+          case "done":
+            if (event.reason === "turn_limit") {
+              setError(
+                `Stopped after ${settings.maxBotTurns} handoffs — the room was still going. Raise the limit in Settings if that was too early.`,
+              );
+            }
+            break;
         }
-
-        setStory(buffer);
       }
     } catch (err) {
-      if (err instanceof DOMException && err.name === "AbortError") return;
-      setError(err instanceof Error ? err.message : "Something went wrong.");
+      if (!(err instanceof Error && err.name === "AbortError")) {
+        setError(err instanceof Error ? err.message : "Something went wrong.");
+      }
     } finally {
+      setSpend((s) => s + estimateCost(turnUsage, settings.modelId));
       setBusy(false);
+      setLive(null);
+      abortRef.current = null;
     }
-  }
+  }, [input, busy, settings, transcript]);
 
-  const year = meta ? new Date(meta.createdAt).getFullYear() : null;
+  const reset = () => {
+    stop();
+    clearAll();
+    setSettings(DEFAULT_SETTINGS);
+    setTranscript([]);
+    setSpend(0);
+    setError(null);
+    setShowSettings(false);
+  };
+
+  const roomBots = settings.roster.map(getBot).filter(Boolean);
 
   return (
-    <div className="relative z-10 mx-auto max-w-3xl px-5 pb-32 pt-10 sm:px-8 sm:pt-16">
-      <header className="mb-16 flex items-center justify-between sm:mb-24">
-        <span className="text-sm font-semibold tracking-tight text-[#f2ece5]">
-          Shipped
-        </span>
-        <a
-          href="https://github.com/deviljoker1911-beep/ShipByThursday_via_claude"
-          className="text-xs text-(--color-muted) underline-offset-4 transition-colors hover:text-(--color-ember) hover:underline"
-        >
-          Built in 72 hours with Claude
-        </a>
-      </header>
+    <div className="flex h-dvh flex-col">
+      <header className="flex shrink-0 items-center gap-3 border-b border-(--color-edge) px-4 py-3 sm:px-6">
+        <span className="text-sm font-semibold tracking-tight text-[#f2ece5]">Galaxy</span>
 
-      <h1 className="max-w-xl text-4xl leading-[1.1] font-semibold tracking-tight text-balance text-[#f7f2ec] sm:text-5xl">
-        Every repo is a story.
-        <br />
-        <span className="text-(--color-muted)">Almost nobody reads it.</span>
-      </h1>
+        <div className="ml-1 flex -space-x-1.5">
+          {roomBots.map((b) => (
+            <span
+              key={b!.id}
+              title={`${b!.name} · ${b!.role}`}
+              className="flex size-6 items-center justify-center rounded-full border-2 border-(--color-ink) text-[10px] font-semibold"
+              style={{ background: `${b!.accent}28`, color: b!.accent }}
+            >
+              {b!.name.slice(0, 1)}
+            </span>
+          ))}
+        </div>
 
-      <p className="mt-6 max-w-xl text-[15px] leading-relaxed text-(--color-muted)">
-        A commit log is the most honest record a project has — every decision,
-        reversal and long quiet stretch, timestamped. Paste a public repository
-        and get the story that's been sitting in it the whole time.
-      </p>
-
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          void run(repo);
-        }}
-        className="mt-10"
-      >
-        <div className="flex flex-col gap-2.5 sm:flex-row">
-          <input
-            value={repo}
-            onChange={(e) => setRepo(e.target.value)}
-            placeholder="github.com/owner/repo"
-            spellCheck={false}
-            autoCapitalize="none"
-            autoCorrect="off"
-            aria-label="GitHub repository URL"
-            className="min-w-0 flex-1 rounded-lg border border-(--color-edge) bg-(--color-surface) px-4 py-3 text-[15px] text-[#f2ece5] transition-colors outline-none placeholder:text-[#5f574f] focus:border-(--color-ember)"
-          />
+        <div className="ml-auto flex items-center gap-2 text-[11px] text-[#5f574f]">
+          <span className="hidden font-mono sm:inline" title="Estimated spend on your key">
+            {formatCost(spend)}
+          </span>
+          {transcript.length > 0 && (
+            <button
+              onClick={() => {
+                stop();
+                setTranscript([]);
+                setError(null);
+              }}
+              className="rounded-md border border-(--color-edge) px-2 py-1 transition-colors hover:text-[#f2ece5]"
+            >
+              New room
+            </button>
+          )}
           <button
-            type="submit"
-            disabled={busy || !repo.trim()}
-            className="shrink-0 rounded-lg bg-(--color-ember) px-6 py-3 text-[15px] font-medium text-[#1a0d03] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
+            onClick={() => setShowSettings(true)}
+            className="rounded-md border border-(--color-edge) px-2 py-1 transition-colors hover:text-[#f2ece5]"
           >
-            {busy ? "Reading…" : "Read it"}
+            Settings
           </button>
         </div>
-      </form>
+      </header>
 
-      <div className="mt-4 flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs text-[#5f574f]">
-        <span>Try</span>
-        {EXAMPLES.map((example) => (
-          <button
-            key={example}
-            type="button"
-            disabled={busy}
-            onClick={() => {
-              setRepo(example);
-              void run(example);
-            }}
-            className="rounded-md border border-(--color-edge) px-2 py-1 font-mono text-[11px] text-(--color-muted) transition-colors hover:border-(--color-ember) hover:text-(--color-ember) disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            {example.split("/")[1]}
-          </button>
-        ))}
-      </div>
+      <main className="min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6">
+        <div className="mx-auto flex max-w-3xl flex-col gap-5">
+          {ready && transcript.length === 0 && !live && (
+            <Welcome
+              hasKey={Boolean(settings.apiKey.trim())}
+              onOpenSettings={() => setShowSettings(true)}
+              onPick={(prompt) => setInput(prompt)}
+            />
+          )}
 
-      {error && (
-        <p className="mt-10 rounded-lg border border-[#5c2e22] bg-[#1d110c] px-4 py-3 text-sm text-[#e8a488]">
-          {error}
-        </p>
+          {transcript.map((turn, i) =>
+            turn.kind === "human" ? (
+              <HumanMessage key={i} text={turn.text} />
+            ) : turn.kind === "bot" ? (
+              <BotMessage key={i} botId={turn.botId} text={turn.text} />
+            ) : (
+              <HandoffNote key={i} from={turn.from} to={turn.to} brief={turn.brief} />
+            ),
+          )}
+
+          {live && live.text && (
+            <BotMessage botId={live.botId} text={live.text} streaming />
+          )}
+          {live && !live.text && (
+            <ToolNote botId={live.botId} detail={live.tool ?? "thinking"} />
+          )}
+          {live && live.text && live.tool && (
+            <ToolNote botId={live.botId} detail={live.tool} />
+          )}
+
+          {error && (
+            <p className="rounded-lg border border-[#5c2e22] bg-[#1d110c] px-4 py-3 text-sm text-[#e8a488]">
+              {error}
+            </p>
+          )}
+
+          <div ref={bottomRef} />
+        </div>
+      </main>
+
+      <Composer
+        value={input}
+        onChange={setInput}
+        onSend={send}
+        onStop={stop}
+        busy={busy}
+        disabled={!ready}
+        placeholder={
+          settings.apiKey.trim()
+            ? `Message ${roomBots.map((b) => b!.name).join(", ")}…`
+            : "Add your API key in Settings to begin…"
+        }
+      />
+
+      {showSettings && (
+        <SettingsPanel
+          settings={settings}
+          onChange={setSettings}
+          onClose={() => setShowSettings(false)}
+          onReset={reset}
+        />
       )}
-
-      {meta && (
-        <dl className="mt-14 grid grid-cols-2 gap-x-6 gap-y-5 border-t border-(--color-edge) pt-6 sm:grid-cols-4">
-          {[
-            ["Repository", meta.fullName.split("/")[1]],
-            ["Commits", meta.totalCommits.toLocaleString()],
-            ["Since", year ? String(year) : "—"],
-            ["Read", meta.sampled ? `${meta.sampledCommits} sampled` : "all of them"],
-          ].map(([label, value]) => (
-            <div key={label}>
-              <dt className="text-[10px] font-medium tracking-[0.14em] text-[#5f574f] uppercase">
-                {label}
-              </dt>
-              <dd className="mt-1.5 truncate text-sm text-[#f2ece5]">{value}</dd>
-            </div>
-          ))}
-        </dl>
-      )}
-
-      {busy && !story && (
-        <p className="mt-10 text-sm text-(--color-muted)">
-          Reading the history…
-        </p>
-      )}
-
-      {story && (
-        <article className={`story mt-10 ${busy ? "story-streaming" : ""}`}>
-          <Markdown>{story}</Markdown>
-        </article>
-      )}
-
-      <footer className="mt-28 border-t border-(--color-edge) pt-6 text-xs leading-relaxed text-[#5f574f]">
-        Built with Claude between Tuesday and Thursday, in the open. The commits
-        are the receipts —{" "}
-        <a
-          href="https://github.com/deviljoker1911-beep/ShipByThursday_via_claude"
-          className="underline underline-offset-4 transition-colors hover:text-(--color-ember)"
-        >
-          read this repo&rsquo;s own story
-        </a>
-        .
-      </footer>
     </div>
   );
 }
