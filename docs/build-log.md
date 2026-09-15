@@ -47,3 +47,26 @@ versions on `0.x`. Worth checking on any `0.x` dependency.
 
 ### Next
 End-to-end run needs an `ANTHROPIC_API_KEY`. GitHub layer, build, and UI verified.
+
+### Hardening pass
+Ran the GitHub layer against real repos looking for ways it breaks. Found one
+that would have hit people constantly: `https://github.com/owner/repo?tab=readme-ov-file`
+returned 404. The URL pattern matched "anything up to a slash", so the query
+string became part of the repo name. That exact suffix is what GitHub's own
+copy-link button produces, so a large share of pasted URLs would have failed
+with "repo not found" — the least debuggable possible error, because the repo
+obviously does exist.
+
+Fixed by matching GitHub's real character sets for owner and repo instead of
+a loose catch-all. Locked in with tests (`npm test`), which also cover `.git`
+suffixes, `git@` remotes, deep links, `#readme` anchors, and bare `owner/repo`.
+Node 26 runs TypeScript tests natively — no test framework, no new dependencies.
+
+Two smaller ones: `next build` and `next dev` share `.next`, and running the
+build while the dev server was live corrupted its chunks into a runtime
+TypeError that looked like an app bug and wasn't. And a constructor parameter
+property in `GitHubError` blocked Node's type stripping, so the module couldn't
+be run outside a bundler — worth avoiding in any file you might want to test
+directly.
+
+Verified: mobile at 375px, production build, typecheck, 3 test files passing.

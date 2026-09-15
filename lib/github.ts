@@ -69,11 +69,18 @@ export function parseRepoRef(input: string): RepoRef {
   const trimmed = input.trim().replace(/\.git$/, "").replace(/\/+$/, "");
   if (!trimmed) throw new GitHubError("Enter a GitHub repository.", 400);
 
+  // Owner and repo are matched against GitHub's actual legal character sets
+  // rather than "anything up to a slash". That matters: GitHub's own copy-link
+  // button hands you `...?tab=readme-ov-file`, and a looser pattern captures
+  // the query string as part of the repo name and then 404s.
+  const OWNER = "[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?";
+  const REPO = "[A-Za-z0-9._-]+";
+
   const patterns = [
-    /^https?:\/\/(?:www\.)?github\.com\/([^/\s]+)\/([^/\s]+)/i,
-    /^git@github\.com:([^/\s]+)\/([^/\s]+)$/i,
-    /^github\.com\/([^/\s]+)\/([^/\s]+)/i,
-    /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/,
+    new RegExp(`^https?://(?:www\\.)?github\\.com/(${OWNER})/(${REPO})`, "i"),
+    new RegExp(`^git@github\\.com:(${OWNER})/(${REPO})$`, "i"),
+    new RegExp(`^github\\.com/(${OWNER})/(${REPO})`, "i"),
+    new RegExp(`^(${OWNER})/(${REPO})$`),
   ];
 
   for (const pattern of patterns) {
