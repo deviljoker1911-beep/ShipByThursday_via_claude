@@ -282,3 +282,75 @@ armour never making anything invulnerable, every resource actually reaching the
 stockpile, towers defending themselves, attack-move engaging en route, order
 queues, repair, map connectivity across 60 seeds, and complete matches played
 out by the AI on both sides.
+
+## Day 2 (cont.) — Phase 2: RTS UX
+
+### Built
+Fog of war (in the simulation, per player, with remembered buildings), group
+formations with role ordering and matched speeds, context orders as a pure and
+tested module, patrol, rally points (including rally-to-resource), training
+cancellation, an alarm and back-to-work, attack-move, control groups,
+double-click selection, keyboard shortcuts, touch gestures, edge scrolling and
+camera bounds, a diamond minimap with fog, pings and click-to-order, a
+selection panel with portraits and stats, a command card that explains why a
+button is disabled, an objectives checklist for the opening, an end screen that
+says why you won or lost, a start screen with difficulty, and a compact layout
+for phones held sideways.
+
+### What playing it found
+**A passive player lost at 2:37.** Four villagers gathering, nothing else, and
+the town centre was gone before three minutes. Six melee units razed a 900-HP
+town centre in about sixteen seconds while its arrows did almost nothing. That
+is the opposite of "a new player can play for ten to twenty minutes".
+
+**Delaying the AI made "easy" the hardest level.** The first fix was a later
+first attack on easier settings. Measured, it made easy arrive at nine minutes
+with a first wave of 32 to 54 units — waiting just let the army grow. Difficulty
+now caps army size over time as well as timing. First waves: easy 10 units at
+~9 minutes, normal 11–12 at ~5.5, hard 6–9 at ~2.5. Income is never touched.
+
+**The alarm never worked.** Shelters were chosen with `isArmed`, which is true
+for every unit, so villagers ran to each other. The AI had been using it since
+Phase 1; its villagers only survived raids because the alarm happened to stop
+them gathering.
+
+**Clicking a villager beside a building selected the building.** Hit-testing
+used a rectangle that claims the empty space above a roof's corners. Now it uses
+the building's real outline, and units take priority.
+
+**A villager gave up on a berry bush it could see.** Two villagers wanted the
+one free spot beside a bush; the loser decided the bush was unreachable and went
+idle. It now retries, then tries other tiles in the patch. A regression test
+sends eight villagers to one tile across four maps; without the fix, seven of
+eight gave up.
+
+### Fairness, measured
+- Maps were not fair: only gold and stone were mirrored, and the start
+  resources for one player pointed into the water border. Maps are now exactly
+  point-symmetric, verified over 1,000 seeds.
+- Combat was not fair: hits resolved one at a time, so whoever was processed
+  first won mirror duels 23 times in 24. Merely alternating the order just moved
+  the bias. Hits now resolve simultaneously; mirror duels end in mutual
+  destruction, as they should.
+- The guarantee that every start has all four resources in reach failed on
+  roughly one map in fifty to one in a thousand, four separate ways, every one
+  of them a check made before the step that could invalidate it: lanes carved
+  over gold, the border painted over stone, later deposits placed on earlier
+  ones, and a guarantee met by a deposit that wasn't protected. Now zero in
+  1,000.
+
+### Performance
+Profiled rather than guessed. Pathfinding was over half of simulation time,
+because a path to an impassable goal — every tree, every building — can never
+reach it, so A* flooded the whole map before settling for the closest tile.
+Paths now finish as soon as they're next to their target. 3.4× faster: 0.098 ms
+per tick, and 25 simulated minutes in 4.4 seconds. The worst single tick is
+11.5 ms, which is still the thing to watch in a large late-game fight.
+
+### Movement
+Formations exposed two deadlocks. Units sharing one waypoint in a narrow pass
+crept toward it while separation pushed them away, forever; and two formation
+slots could round to the same tile. Waypoints now only need approaching, paths
+end at the exact slot, idle units step aside for moving ones, and a general
+stuck detector ends any move that has stopped making progress for three
+seconds — the backstop for a class of bug this codebase has now hit six times.

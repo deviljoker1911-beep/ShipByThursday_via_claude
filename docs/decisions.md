@@ -129,3 +129,38 @@ standing still" — near-invisible by eye, unambiguous in a test.
 The split also happens to be the right architecture: a simulation that doesn't
 know about pixels is the precondition for headless testing, deterministic
 replays, and eventually a networked server.
+
+## D8 — Left-click selects, right-click orders
+
+**Context:** Phase 1 made a left-click an order whenever units were selected,
+which works for touch but fights every RTS player's habits on desktop.
+
+**Choice:** The genre's model on desktop. Touch keeps tap-to-order, because it
+has no second button — a tap on your own unit selects it, a tap elsewhere is the
+order, and a long press starts a selection box.
+
+**Trade-off:** Two input models to maintain and test. Worth it: each one is what
+its players already know.
+
+## D9 — Difficulty changes decisions, not income
+
+**Context:** A passive player lost in under three minutes.
+
+**Choice:** Three levels that change when the AI first attacks, how big an army
+it will field over time, how many workers it trains and how quickly it reacts.
+Never its resources, costs or gather rates.
+
+**Trade-off:** A skilled player on easy will find the AI passive. That's the
+point of easy. The brief allows resource bonuses only as an explicit difficulty
+modifier, and none were needed.
+
+## D10 — Fog of war lives in the simulation
+
+**Context:** Fog could have been a rendering effect.
+
+**Choice:** It's game state: per player, deterministic, and the AI plans from it.
+Enemies in fog can't be clicked; effects in fog aren't drawn.
+
+**Trade-off:** Slightly more work per tick (vision is recomputed five times a
+second, not every tick). In exchange the AI can't cheat by seeing through it,
+and scouting matters for both sides.

@@ -1,222 +1,187 @@
 "use client";
 
-import { BUILDINGS, UNITS } from "@/game/config";
+import { useEffect, useState } from "react";
 import { useGame } from "@/game/useGame";
-import type { BuildingKind, UnitKind } from "@/game/types";
+import { Minimap } from "@/components/hud/Minimap";
+import {
+  CommandCard,
+  Groups,
+  Objectives,
+  QuickActions,
+  SelectionPanel,
+  Toasts,
+  TopBar,
+  frame,
+} from "@/components/hud/Panels";
+import { EndScreen, Menu, PausedBadge, StartScreen } from "@/components/hud/Overlays";
 
-const BUILD_ORDER: BuildingKind[] = [
-  "house",
-  "farm",
-  "storehouse",
-  "barracks",
-  "tower",
-  "towncenter",
-];
-
-function cost(c: Partial<Record<string, number>>) {
-  return Object.entries(c)
-    .map(([r, n]) => `${n}${r[0].toUpperCase()}`)
-    .join(" ");
-}
-
-function clock(seconds: number) {
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${String(s).padStart(2, "0")}`;
+function useMedia(query: string) {
+  const [match, setMatch] = useState(false);
+  useEffect(() => {
+    const q = window.matchMedia(query);
+    const update = () => setMatch(q.matches);
+    update();
+    q.addEventListener("change", update);
+    return () => q.removeEventListener("change", update);
+  }, [query]);
+  return match;
 }
 
 export default function Page() {
-  const {
-    canvasRef,
-    hud,
-    placing,
-    newGame,
-    train,
-    startPlacing,
-    selectAllVillagers,
-    selectAllMilitary,
-    focusTownCentre,
-    handlers,
-  } = useGame();
+  const { canvasRef, hud, input, newGame, begin, togglePause, minimapSource, touched } = useGame();
+  const [menu, setMenu] = useState(false);
+  // A phone held sideways is wide but very short, so compact mode keys on
+  // height as well as width — otherwise the HUD takes half the screen.
+  const compact = useMedia("(max-width: 640px), (max-height: 520px)");
+  const touch = useMedia("(pointer: coarse)");
 
-  const capped = hud.pop >= hud.popCap;
+  // Opening the menu pauses; closing it resumes only if it paused.
+  const openMenu = () => {
+    if (hud.started && !hud.paused) togglePause();
+    setMenu(true);
+  };
+  const closeMenu = () => {
+    if (hud.started && hud.paused) togglePause();
+    setMenu(false);
+  };
+
+  const run = (id: string) => {
+    input.run(id);
+    touched();
+  };
+
+  const modeLabel =
+    hud.mode.kind === "attackMove"
+      ? "Attack-move: click a destination · right-click to cancel"
+      : hud.mode.kind === "patrol"
+        ? "Patrol: click the far end · right-click to cancel"
+        : hud.mode.kind === "place"
+          ? "Place the building · Shift to place several · right-click to cancel"
+          : null;
 
   return (
-    <div className="relative h-dvh w-full overflow-hidden">
+    <div className="relative h-dvh w-full overflow-hidden bg-[#0e0c0a] select-none">
       <canvas
         ref={canvasRef}
         onContextMenu={(e) => e.preventDefault()}
-        {...handlers}
+        onPointerDown={(e) => input.pointerDown(e.nativeEvent)}
+        onPointerMove={(e) => input.pointerMove(e.nativeEvent)}
+        onPointerUp={(e) => {
+          input.pointerUp(e.nativeEvent);
+          touched();
+        }}
+        onPointerCancel={(e) => input.pointerCancel(e.nativeEvent)}
       />
 
-      {/* Resources */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 flex flex-wrap items-center gap-x-4 gap-y-1 bg-gradient-to-b from-black/75 to-transparent px-3 py-2 text-[13px] sm:px-4 sm:text-sm">
-        <span className="font-semibold tracking-tight text-[#f2ece5]">Emberhold</span>
-        <Stat label="Food" value={hud.food} color="#e0705a" />
-        <Stat label="Wood" value={hud.wood} color="#b08050" />
-        <Stat label="Gold" value={hud.gold} color="#e8c46a" />
-        <Stat label="Stone" value={hud.stone} color="#b9b7b0" />
-        <span className={capped ? "text-[#e0705a]" : "text-(--color-muted)"}>
-          Pop <span className="font-mono text-[#f2ece5]">{hud.pop}/{hud.popCap}</span>
-        </span>
-        <span className="ml-auto font-mono text-(--color-muted)">{clock(hud.time)}</span>
+      {/* Top: resources */}
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex justify-center px-2">
+        <div className="w-full max-w-4xl">
+          <TopBar
+            hud={hud}
+            onIdle={() => {
+              input.selectIdleVillager();
+              touched();
+            }}
+            onPause={togglePause}
+            onMenu={openMenu}
+          />
+        </div>
       </div>
 
-      {/* Notices */}
-      {hud.notices.length > 0 && (
-        <div className="pointer-events-none absolute top-12 left-1/2 flex -translate-x-1/2 flex-col items-center gap-1">
-          {hud.notices.map((n, i) => (
-            <span
-              key={i}
-              className="rounded-md bg-black/75 px-3 py-1.5 text-xs text-[#e8a488]"
-            >
-              {n}
-            </span>
-          ))}
-        </div>
-      )}
+      {/* Left: objectives */}
+      <div className={`pointer-events-none absolute left-2 z-10 ${compact ? "top-11" : "top-14"}`}>
+        <Objectives items={hud.objectives} compact={compact} />
+      </div>
 
-      {placing && (
-        <div className="pointer-events-none absolute top-12 left-1/2 -translate-x-1/2 rounded-md bg-black/75 px-3 py-1.5 text-xs text-(--color-body)">
-          Placing {BUILDINGS[placing].name} — click a spot, Esc to cancel
-        </div>
-      )}
+      {/* Centre: alerts, notices, and the active mode */}
+      <div className="pointer-events-none absolute inset-x-0 top-12 z-10 flex flex-col items-center gap-1 px-2 sm:top-14">
+        <Toasts
+          notices={hud.notices}
+          alerts={hud.alerts}
+          onAlert={() => {
+            input.jumpToAlert();
+            touched();
+          }}
+        />
+        {modeLabel && (
+          <span className="rounded-md bg-[#3a2410]/90 px-3 py-1 text-[12px] text-[#ffcf96]">{modeLabel}</span>
+        )}
+      </div>
 
-      {/* Command bar */}
-      <div className="absolute inset-x-0 bottom-0 border-t border-(--color-edge) bg-(--color-panel)/95 backdrop-blur">
-        <div className="flex items-stretch gap-2 overflow-x-auto px-2 py-2 sm:px-3">
-          <div className="flex shrink-0 flex-col gap-1">
-            <span className="text-[10px] tracking-[0.12em] text-[#5f574f] uppercase">
-              Select
-            </span>
-            <div className="flex gap-1">
-              <Chip onClick={selectAllVillagers}>Villagers</Chip>
-              <Chip onClick={selectAllMilitary}>Army</Chip>
-              <Chip onClick={focusTownCentre}>Centre</Chip>
+      {/* Bottom: minimap · selection · commands */}
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex flex-col gap-1 p-1.5 sm:p-2">
+        <Groups
+          groups={hud.groups}
+          onRecall={(n) => {
+            input.recallGroup(n);
+            touched();
+          }}
+        />
+        <div
+          className={`pointer-events-auto flex items-stretch gap-2 overflow-x-auto rounded-lg ${frame} ${
+            compact ? "max-h-[118px] p-1" : "p-1.5"
+          }`}
+        >
+          <div className="flex shrink-0 flex-col gap-1.5">
+            <div className="rounded border border-[#3a2f25] bg-black/50 p-1">
+              <Minimap source={minimapSource} input={input} width={compact ? 104 : 176} onChange={touched} />
             </div>
+            <QuickActions
+              compact={compact}
+              onArmy={() => {
+                input.selectArmy();
+                touched();
+              }}
+              onTown={() => {
+                input.focusTownCentre();
+                touched();
+              }}
+              onAlarm={() => input.alarm()}
+              onWork={() => input.resumeWork()}
+            />
           </div>
 
-          <div className="w-px shrink-0 bg-(--color-edge)" />
-
-          <div className="flex shrink-0 flex-col gap-1">
-            <span className="text-[10px] tracking-[0.12em] text-[#5f574f] uppercase">
-              Build <span className="normal-case opacity-70">(select a villager)</span>
-            </span>
-            <div className="flex gap-1">
-              {BUILD_ORDER.map((kind) => (
-                <Chip
-                  key={kind}
-                  active={placing === kind}
-                  onClick={() => startPlacing(kind)}
-                  sub={cost(BUILDINGS[kind].cost)}
-                >
-                  {BUILDINGS[kind].name}
-                </Chip>
-              ))}
-            </div>
+          <div className="min-w-[180px] flex-1 border-l border-[#3a2f25]">
+            <SelectionPanel
+              touch={touch}
+              selection={hud.selection}
+              onCancel={(i) => {
+                input.cancelQueue(i);
+                touched();
+              }}
+              onDeselect={() => {
+                input.deselect();
+                touched();
+              }}
+            />
           </div>
 
-          {hud.canTrain.length > 0 && (
-            <>
-              <div className="w-px shrink-0 bg-(--color-edge)" />
-              <div className="flex shrink-0 flex-col gap-1">
-                <span className="text-[10px] tracking-[0.12em] text-[#5f574f] uppercase">
-                  Train
-                </span>
-                <div className="flex gap-1">
-                  {hud.canTrain.map((t) => (
-                    <Chip
-                      key={t.kind}
-                      disabled={!t.affordable}
-                      onClick={() => train(t.from, t.kind)}
-                      sub={cost(UNITS[t.kind].cost)}
-                    >
-                      {UNITS[t.kind].name}
-                    </Chip>
-                  ))}
-                </div>
-              </div>
-            </>
+          {hud.commands.length > 0 && (
+            <div className="shrink-0 border-l border-[#3a2f25]">
+              <CommandCard commands={hud.commands} onRun={run} />
+            </div>
           )}
-
-          <div className="ml-auto flex shrink-0 items-end">
-            <span className="px-2 pb-1 text-[11px] text-(--color-muted)">
-              {hud.selection.length === 0
-                ? "Drag to select · right-drag to pan"
-                : hud.selection
-                    .map((s) => `${s.count}× ${labelFor(s.kind)}`)
-                    .join(", ")}
-            </span>
-          </div>
         </div>
       </div>
 
-      {hud.outcome !== "playing" && (
-        <div className="absolute inset-0 grid place-items-center bg-black/80 p-6">
-          <div className="max-w-sm rounded-2xl border border-(--color-edge) bg-(--color-panel) p-6 text-center">
-            <h2 className="text-2xl font-semibold text-[#f7f2ec]">
-              {hud.outcome === "won" ? "The valley is yours" : "Your hold has fallen"}
-            </h2>
-            <p className="mt-2 text-sm text-(--color-muted)">
-              {hud.outcome === "won"
-                ? `Enemy town centre destroyed in ${clock(hud.time)}.`
-                : `You lost your town centre after ${clock(hud.time)}.`}
-            </p>
-            <button
-              onClick={newGame}
-              className="mt-5 rounded-lg bg-(--color-ember) px-5 py-2.5 text-sm font-medium text-[#1a0d03] transition-opacity hover:opacity-90"
-            >
-              Play again
-            </button>
-          </div>
-        </div>
+      {hud.started && hud.paused && !menu && hud.outcome === "playing" && <PausedBadge />}
+      {!hud.started && !menu && <StartScreen onBegin={begin} onHelp={() => setMenu(true)} />}
+      {menu && (
+        <Menu
+          onResume={closeMenu}
+          onRestart={() => {
+            setMenu(false);
+            newGame(hud.difficulty);
+          }}
+        />
       )}
+      <EndScreen hud={hud} onRestart={() => newGame(hud.difficulty)} />
+
+      <div className="pointer-events-none absolute inset-0 z-50 hidden items-center justify-center bg-black/85 p-8 text-center portrait:max-sm:flex">
+        <p className="font-serif text-lg text-[#f2dcc0]">
+          Turn your phone sideways — Emberhold plays in landscape.
+        </p>
+      </div>
     </div>
-  );
-}
-
-function labelFor(kind: string) {
-  if (kind in UNITS) return UNITS[kind as UnitKind].name;
-  if (kind in BUILDINGS) return BUILDINGS[kind as BuildingKind].name;
-  return kind;
-}
-
-function Stat({ label, value, color }: { label: string; value: number; color: string }) {
-  return (
-    <span className="text-(--color-muted)">
-      <span style={{ color }}>{label}</span>{" "}
-      <span className="font-mono text-[#f2ece5]">{value}</span>
-    </span>
-  );
-}
-
-function Chip({
-  children,
-  sub,
-  onClick,
-  active,
-  disabled,
-}: {
-  children: React.ReactNode;
-  sub?: string;
-  onClick: () => void;
-  active?: boolean;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className={`min-w-16 rounded-lg border px-2.5 py-1.5 text-left transition-colors ${
-        active
-          ? "border-(--color-ember) bg-[#e8873c18] text-(--color-ember)"
-          : "border-(--color-edge) text-(--color-body) hover:border-[#4a443d]"
-      } disabled:cursor-not-allowed disabled:opacity-35`}
-    >
-      <span className="block text-[12px] leading-tight whitespace-nowrap">{children}</span>
-      {sub && (
-        <span className="block font-mono text-[9px] leading-tight text-[#5f574f]">{sub}</span>
-      )}
-    </button>
   );
 }

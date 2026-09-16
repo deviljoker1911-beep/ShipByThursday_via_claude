@@ -31,7 +31,51 @@ import type { BuildingKind, Entity, Owner, Resource, UnitKind, World } from "./t
  * rules as the player.
  */
 
+export type Difficulty = "easy" | "normal" | "hard";
+
+/**
+ * How the AI plays at each level.
+ *
+ * Difficulty changes decisions — when it first attacks, how big a wave it
+ * waits for, how many workers it bothers training, how quickly it reacts —
+ * and never its economy. It gets exactly the player's resources and rates at
+ * every level.
+ *
+ * Normal's first attack is set so a new player has a real opening to learn
+ * in: with the old timing, a player who only put villagers to work lost their
+ * town centre at 2:37.
+ */
+export const PROFILES: Record<
+  Difficulty,
+  {
+    firstAttack: number;
+    minWave: number;
+    waveGap: number;
+    maxVillagers: number;
+    think: number;
+    /** Largest army it will field: base, plus this many per minute of play. */
+    armyBase: number;
+    armyPerMinute: number;
+  }
+> = {
+  easy: { firstAttack: 540, minWave: 6, waveGap: 120, maxVillagers: 10, think: 2.0, armyBase: 3, armyPerMinute: 0.8 },
+  normal: { firstAttack: 330, minWave: 6, waveGap: 75, maxVillagers: 14, think: 1.3, armyBase: 4, armyPerMinute: 1.4 },
+  hard: { firstAttack: 150, minWave: 5, waveGap: 55, maxVillagers: 18, think: 1.0, armyBase: 6, armyPerMinute: 2.4 },
+};
+
+/**
+ * The army ceiling at a point in the match.
+ *
+ * A later first attack alone doesn't make an AI easier — it gives the army
+ * longer to grow. Measured before this cap existed, "easy" arrived at nine
+ * minutes with a first wave of 32 to 54 units, the largest of any level.
+ */
+export function armyCap(profile: (typeof PROFILES)[Difficulty], time: number): number {
+  return Math.floor(profile.armyBase + profile.armyPerMinute * (time / 60));
+}
+
 interface AiMemory {
+  profile: (typeof PROFILES)[Difficulty];
   nextThink: number;
   nextAttack: number;
   wave: number;
@@ -51,10 +95,12 @@ interface AiMemory {
   defending: boolean;
 }
 
-function blankMemory(): AiMemory {
+function blankMemory(difficulty: Difficulty = "normal"): AiMemory {
+  const profile = PROFILES[difficulty];
   return {
+    profile,
     nextThink: 0,
-    nextAttack: 70,
+    nextAttack: profile.firstAttack,
     wave: 0,
     seen: { infantry: 0, ranged: 0, cavalry: 0, building: 0 },
     scoutId: null,
@@ -74,18 +120,20 @@ function blankMemory(): AiMemory {
  * something that only works against a passive player.
  */
 const memories = new Map<Owner, AiMemory>();
+let configured: Partial<Record<Owner, Difficulty>> = {};
 
 function mem(owner: Owner): AiMemory {
   let m = memories.get(owner);
   if (!m) {
-    m = blankMemory();
+    m = blankMemory(configured[owner]);
     memories.set(owner, m);
   }
   return m;
 }
 
-export function resetAi() {
+export function resetAi(difficulty: Partial<Record<Owner, Difficulty>> = {}) {
   memories.clear();
+  configured = difficulty;
 }
 
 /**
@@ -108,7 +156,7 @@ export function tickAi(world: World, dt: number, owner: Owner = 1) {
   memory.nextThink -= dt;
   memory.nextAttack -= dt;
   if (memory.nextThink > 0) return;
-  memory.nextThink = 1.1;
+  memory.nextThink = memory.profile.think;
 
   const own = mine(world, owner);
   const tc = own.find((e) => e.kind === "towncenter");
@@ -386,9 +434,15 @@ function manageProduction(
 ) {
   // Economy first, and keep replacing losses — an AI that stops making
   // villagers after a raid never recovers.
-  if (villagers.length < 14 && (tc.queue?.length ?? 0) < 2) {
+  if (villagers.length < memory.profile.maxVillagers && (tc.queue?.length ?? 0) < 2) {
     enqueueTraining(world, tc, "villager");
   }
+
+  const soldiers = [...world.entities.values()].filter(
+    (e) => e.owner === owner && (e.kind === "spearman" || e.kind === "archer" || e.kind === "rider"),
+  ).length;
+  const queued = barracks.reduce((n, b) => n + (b.queue?.length ?? 0), 0);
+  if (soldiers + queued >= armyCap(memory.profile, world.time)) return;
 
   for (const b of barracks) {
     if ((b.queue?.length ?? 0) >= 2) continue;
@@ -456,11 +510,12 @@ function considerAttack(world: World, army: Entity[], owner: Owner, memory: AiMe
   // Capped deliberately. An ever-growing threshold means both sides keep
   // massing and neither commits, which is how a match runs past the hour with
   // two full armies standing in their own bases.
-  const needed = Math.min(5 + memory.wave * 2, 13);
+  const needed = Math.min(memory.profile.minWave + memory.wave * 2, 13);
   const idleArmy = army.filter((s) => s.state?.name === "idle").length;
   // If most of the army is standing around and it's big enough, go now —
-  // waiting out a timer with twenty idle soldiers looks like indecision.
-  const impatient = idleArmy >= needed && idleArmy >= army.length * 0.6;
+  // waiting out a timer with twenty idle soldiers looks like indecision. Not
+  // before the first wave, though: that timer is the player's opening.
+  const impatient = memory.wave > 0 && idleArmy >= needed && idleArmy >= army.length * 0.6;
   if ((memory.nextAttack > 0 && !impatient) || army.length < needed) return;
 
   // Objectives must be *static*. Sending a wave at a villager means sending it
@@ -511,7 +566,7 @@ function considerAttack(world: World, army: Entity[], owner: Owner, memory: AiMe
     queue: false,
   });
   memory.wave++;
-  memory.nextAttack = 55;
+  memory.nextAttack = memory.profile.waveGap;
 }
 
 function place(

@@ -1,39 +1,48 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { BUILDINGS, UNITS, isBuilding, isUnit } from "./config.ts";
-import { screenToTile, tileToScreen, type Camera } from "./iso.ts";
-import { centerOn, render } from "./render.ts";
-import { resetAi, tickAi } from "./ai.ts";
+import type { Camera } from "./iso.ts";
+import { centerOn, centerTile, viewCorners } from "./camera.ts";
+import { render } from "./render.ts";
+import { resetAi, tickAi, type Difficulty } from "./ai.ts";
+import { createWorld, spawn, tick } from "./world.ts";
+import { InputController } from "./input.ts";
 import {
-  canAfford,
-  canPlaceBuilding,
-  commandAttack,
-  commandBuild,
-  commandGather,
-  commandMove,
-  createWorld,
-  enqueueTraining,
-  entityAt,
-  notify,
-  pay,
-  spawn,
-  tick,
-} from "./world.ts";
-import { terrainAt } from "./map.ts";
-import { TERRAIN_IDS, type BuildingKind, type Entity, type UnitKind, type World } from "./types.ts";
+  commandCard,
+  describeSelection,
+  objectives,
+  verdict,
+  type CommandButton,
+  type Mode,
+  type Objective,
+  type Selection,
+  type Verdict,
+} from "./hud.ts";
+import type { Formation, MatchStats, World } from "./types.ts";
 
 /**
  * Glue between React and the simulation.
  *
- * The world is deliberately kept in a ref, not React state: it mutates ~60
- * times a second and re-rendering the tree at that rate would be pointless.
- * React only sees a small HUD snapshot, published a few times a second.
+ * The world lives in a ref, not React state: it changes thirty times a second
+ * and re-rendering the component tree at that rate would buy nothing. React
+ * sees a small snapshot, published a few times a second or when the player
+ * does something.
  */
 
 const TICK = 1 / 30;
+const OWNER = 0 as const;
+
+export interface Alert {
+  text: string;
+  x: number;
+  y: number;
+  at: number;
+}
 
 export interface Hud {
+  /** False until the player has pressed Begin; the clock doesn't run before. */
+  started: boolean;
+  difficulty: Difficulty;
   food: number;
   wood: number;
   gold: number;
@@ -42,12 +51,22 @@ export interface Hud {
   popCap: number;
   time: number;
   outcome: World["outcome"];
-  selection: { kind: string; count: number; ids: number[] }[];
-  canTrain: { kind: UnitKind; from: number; affordable: boolean }[];
+  paused: boolean;
+  idleVillagers: number;
+  selection: Selection;
+  commands: CommandButton[];
+  mode: Mode;
+  formation: Formation;
+  groups: { n: number; count: number }[];
   notices: string[];
+  alerts: Alert[];
+  objectives: Objective[];
+  end: { verdict: Verdict; me: MatchStats; them: MatchStats } | null;
 }
 
-const EMPTY_HUD: Hud = {
+const EMPTY: Hud = {
+  started: false,
+  difficulty: "normal",
   food: 0,
   wood: 0,
   gold: 0,
@@ -56,48 +75,64 @@ const EMPTY_HUD: Hud = {
   popCap: 0,
   time: 0,
   outcome: "playing",
-  selection: [],
-  canTrain: [],
+  paused: false,
+  idleVillagers: 0,
+  selection: { kind: "none", enemy: false, title: "", role: "", count: 0 },
+  commands: [],
+  mode: { kind: "normal" },
+  formation: "line",
+  groups: [],
   notices: [],
+  alerts: [],
+  objectives: [],
+  end: null,
 };
 
 export function useGame() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const worldRef = useRef<World | null>(null);
+  const worldRef = useRef<World>(null as unknown as World);
   const camRef = useRef<Camera>({ ox: 0, oy: 0, zoom: 1 });
-  const selectedRef = useRef<Set<number>>(new Set());
-  const placingRef = useRef<BuildingKind | null>(null);
-  const hoverRef = useRef<{ x: number; y: number } | null>(null);
-  const dragRef = useRef<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
-  const panRef = useRef<{ x: number; y: number } | null>(null);
-  const keysRef = useRef<Set<string>>(new Set());
-  const [hud, setHud] = useState<Hud>(EMPTY_HUD);
-  const [placing, setPlacing] = useState<BuildingKind | null>(null);
+  const pausedRef = useRef(true);
+  const startedRef = useRef(false);
+  const difficultyRef = useRef<Difficulty>("normal");
+  const alertsRef = useRef<Alert[]>([]);
+  const dirtyRef = useRef(true);
+  const [hud, setHud] = useState<Hud>(EMPTY);
 
-  const publishHud = useCallback(() => {
+  const view = useCallback(() => {
+    const c = canvasRef.current;
+    return { width: c?.clientWidth ?? 800, height: c?.clientHeight ?? 600 };
+  }, []);
+
+  const inputRef = useRef<InputController | null>(null);
+  if (!inputRef.current) {
+    worldRef.current = createWorld();
+    inputRef.current = new InputController({
+      world: () => worldRef.current,
+      cam: camRef.current,
+      view,
+      owner: OWNER,
+      changed: () => {
+        dirtyRef.current = true;
+      },
+      togglePause: () => {
+        if (!startedRef.current) return;
+        pausedRef.current = !pausedRef.current;
+        dirtyRef.current = true;
+      },
+      canvas: () => canvasRef.current,
+    });
+  }
+  const input = inputRef.current;
+
+  const publish = useCallback(() => {
     const world = worldRef.current;
-    if (!world) return;
-    const p = world.players[0];
-    const selected = [...selectedRef.current]
-      .map((id) => world.entities.get(id))
-      .filter((e): e is Entity => !!e);
-
-    const byKind = new Map<string, number[]>();
-    for (const e of selected) {
-      if (!byKind.has(e.kind)) byKind.set(e.kind, []);
-      byKind.get(e.kind)!.push(e.id);
-    }
-
-    const canTrain: Hud["canTrain"] = [];
-    for (const e of selected) {
-      if (!isBuilding(e.kind) || e.progress !== 1) continue;
-      for (const kind of BUILDINGS[e.kind as BuildingKind].trains) {
-        if (canTrain.some((c) => c.kind === kind)) continue;
-        canTrain.push({ kind, from: e.id, affordable: canAfford(world, 0, UNITS[kind].cost) });
-      }
-    }
-
+    const p = world.players[OWNER];
+    const mine = [...world.entities.values()].filter((e) => e.owner === OWNER);
+    const done = world.outcome !== "playing";
     setHud({
+      started: startedRef.current,
+      difficulty: difficultyRef.current,
       food: Math.floor(p.food),
       wood: Math.floor(p.wood),
       gold: Math.floor(p.gold),
@@ -106,73 +141,115 @@ export function useGame() {
       popCap: p.popCap,
       time: world.time,
       outcome: world.outcome,
-      selection: [...byKind].map(([kind, ids]) => ({ kind, count: ids.length, ids })),
-      canTrain,
-      notices: world.notices
-        .filter((n) => world.time - n.at < 4)
-        .map((n) => n.text),
+      paused: pausedRef.current,
+      idleVillagers: mine.filter((e) => e.kind === "villager" && e.state?.name === "idle").length,
+      selection: describeSelection(world, OWNER, input.selected),
+      commands: commandCard(world, OWNER, input.selected, input.mode, input.formation),
+      mode: input.mode,
+      formation: input.formation,
+      groups: [...input.groups]
+        .map(([n, ids]) => ({ n, count: ids.filter((id) => world.entities.has(id)).length }))
+        .filter((g) => g.count > 0)
+        .sort((a, b) => a.n - b.n),
+      notices: world.notices.filter((n) => world.time - n.at < 4).map((n) => n.text),
+      alerts: alertsRef.current.filter((a) => world.time - a.at < 6),
+      objectives: objectives(world, OWNER),
+      end: done
+        ? { verdict: verdict(world, OWNER), me: world.stats[OWNER], them: world.stats[1] }
+        : null,
     });
-  }, []);
+  }, [input]);
 
-  const newGame = useCallback(() => {
-    const world = createWorld();
-    worldRef.current = world;
-    selectedRef.current = new Set();
-    placingRef.current = null;
-    setPlacing(null);
-    resetAi();
-    const canvas = canvasRef.current;
-    if (canvas) {
-      const tc = [...world.entities.values()].find(
-        (e) => e.owner === 0 && e.kind === "towncenter",
+  const newGame = useCallback((difficulty: Difficulty = difficultyRef.current, begin = true) => {
+    difficultyRef.current = difficulty;
+    worldRef.current = createWorld();
+    resetAi({ 1: difficulty });
+    alertsRef.current = [];
+    startedRef.current = begin;
+    pausedRef.current = !begin;
+    input.selected.clear();
+    input.groups.clear();
+    input.mode = { kind: "normal" };
+    input.lastAlert = null;
+    camRef.current.zoom = 1;
+    const tc = [...worldRef.current.entities.values()].find(
+      (e) => e.owner === OWNER && e.kind === "towncenter",
+    );
+    if (tc) centerOn(camRef.current, tc.x, tc.y, view());
+    dirtyRef.current = true;
+    publish();
+  }, [input, publish, view]);
+
+  /**
+   * "You are under attack", at most every few seconds per place — enough to
+   * notice a raid, never enough to become noise.
+   */
+  const scanAlerts = useCallback(() => {
+    const world = worldRef.current;
+    for (const fx of world.effects) {
+      if (fx.kind !== "impact" || fx.owner !== OWNER || fx.t < world.time - 0.2) continue;
+      const recent = alertsRef.current.find(
+        (a) => world.time - a.at < 10 && Math.hypot(a.x - fx.x, a.y - fx.y) < 12,
       );
-      camRef.current.zoom = 1;
-      if (tc) {
-        centerOn(camRef.current, tc.x, tc.y, {
-          width: canvas.clientWidth,
-          height: canvas.clientHeight,
-        });
-      }
+      if (recent) continue;
+      const hitTile = [...world.entities.values()].find(
+        (e) => e.owner === OWNER && Math.hypot(e.x - fx.x, e.y - fx.y) < 0.8,
+      );
+      const text =
+        hitTile?.kind === "villager"
+          ? "Your villagers are under attack"
+          : hitTile && hitTile.kind in { towncenter: 1, house: 1, barracks: 1, farm: 1, storehouse: 1, tower: 1 }
+            ? "Your base is under attack"
+            : "Your army is under attack";
+      alertsRef.current = [...alertsRef.current.slice(-5), { text, x: fx.x, y: fx.y, at: world.time }];
+      input.lastAlert = { x: fx.x, y: fx.y };
+      dirtyRef.current = true;
     }
-    publishHud();
-  }, [publishHud]);
+  }, [input]);
 
-  // ---------------------------------------------------------------- loop
+  // ------------------------------------------------------------ loop
   useEffect(() => {
-    newGame();
+    // Build the world straight away so the start screen has a living map
+    // behind it, but hold the clock until the player chooses to begin.
+    newGame("normal", false);
     let raf = 0;
     let last = performance.now();
-    let accumulator = 0;
+    let acc = 0;
     let hudTimer = 0;
+    let lastView = view();
 
     const frame = (now: number) => {
       raf = requestAnimationFrame(frame);
       const canvas = canvasRef.current;
+      if (!canvas) return;
       const world = worldRef.current;
-      if (!canvas || !world) return;
-
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
 
-      // Fixed-step simulation, so behaviour doesn't change with framerate.
-      accumulator += dt;
-      let steps = 0;
-      while (accumulator >= TICK && steps < 5) {
-        tick(world, TICK);
-        tickAi(world, TICK);
-        accumulator -= TICK;
-        steps++;
+      if (!pausedRef.current && world.outcome === "playing") {
+        acc += dt;
+        let steps = 0;
+        while (acc >= TICK && steps < 5) {
+          tick(world, TICK);
+          tickAi(world, TICK, 1);
+          acc -= TICK;
+          steps++;
+        }
+        scanAlerts();
+      }
+      // Hold the centre tile steady whenever the view changes size. This is
+      // what keeps the start centred — the first frame can run before the
+      // stylesheet has stretched the canvas past its 300×150 default — and it
+      // is also what a resized window or a rotated phone needs.
+      const size = view();
+      if (size.width !== lastView.width || size.height !== lastView.height) {
+        const c = centerTile(camRef.current, lastView);
+        centerOn(camRef.current, c.x, c.y, size);
+        lastView = size;
       }
 
-      // Keyboard edge panning.
-      const cam = camRef.current;
-      const panSpeed = 700 * dt;
-      if (keysRef.current.has("ArrowLeft") || keysRef.current.has("a")) cam.ox += panSpeed;
-      if (keysRef.current.has("ArrowRight") || keysRef.current.has("d")) cam.ox -= panSpeed;
-      if (keysRef.current.has("ArrowUp") || keysRef.current.has("w")) cam.oy += panSpeed;
-      if (keysRef.current.has("ArrowDown") || keysRef.current.has("s")) cam.oy -= panSpeed;
+      input.update(dt);
 
-      // Keep the backing store matched to CSS size and DPR.
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const w = canvas.clientWidth;
       const h = canvas.clientHeight;
@@ -180,286 +257,113 @@ export function useGame() {
         canvas.width = Math.round(w * dpr);
         canvas.height = Math.round(h * dpr);
       }
-
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-      const placingKind = placingRef.current;
-      render(ctx, world, cam, { width: w, height: h }, {
-        selected: selectedRef.current,
-        hoverTile: hoverRef.current,
-        placing:
-          placingKind && hoverRef.current
-            ? {
-                kind: placingKind,
-                valid: canPlaceBuilding(
-                  world,
-                  placingKind,
-                  Math.round(hoverRef.current.x),
-                  Math.round(hoverRef.current.y),
-                ),
-              }
-            : null,
-        dragBox: dragRef.current,
+      render(ctx, world, camRef.current, { width: w, height: h }, {
+        owner: OWNER,
+        selected: input.selected,
+        hover: input.hover,
+        placing: input.placementPreview(),
+        dragBox: input.dragBox,
+        modeTint: input.modeTint(),
       });
 
       hudTimer += dt;
-      if (hudTimer > 0.15) {
+      if (dirtyRef.current || hudTimer > 0.15) {
         hudTimer = 0;
-        publishHud();
+        dirtyRef.current = false;
+        publish();
       }
     };
-
     raf = requestAnimationFrame(frame);
-    return () => cancelAnimationFrame(raf);
-  }, [newGame, publishHud]);
 
-  // ---------------------------------------------------------------- keys
-  useEffect(() => {
-    const down = (e: KeyboardEvent) => {
-      keysRef.current.add(e.key);
-      if (e.key === "Escape") {
-        placingRef.current = null;
-        setPlacing(null);
-      }
+    // Nothing on the keyboard should reach the game before it has begun.
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (startedRef.current) input.keyDown(ev);
     };
-    const up = (e: KeyboardEvent) => keysRef.current.delete(e.key);
-    window.addEventListener("keydown", down);
-    window.addEventListener("keyup", up);
-    return () => {
-      window.removeEventListener("keydown", down);
-      window.removeEventListener("keyup", up);
-    };
-  }, []);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", input.keyUp);
+    window.addEventListener("pointermove", input.trackMouse);
+    document.documentElement.addEventListener("mouseleave", input.mouseLeftWindow);
+    const onBlur = () => input.mouseLeftWindow();
+    window.addEventListener("blur", onBlur);
 
-  // ---------------------------------------------------------------- input
-  const localPoint = (ev: { clientX: number; clientY: number }) => {
-    const canvas = canvasRef.current!;
-    const rect = canvas.getBoundingClientRect();
-    return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
-  };
-
-  const onPointerDown = useCallback((ev: React.PointerEvent<HTMLCanvasElement>) => {
-    const world = worldRef.current;
-    if (!world) return;
-    const canvas = canvasRef.current!;
-    canvas.setPointerCapture(ev.pointerId);
-    const p = localPoint(ev);
-
-    // Right button (or two-finger) pans; left selects or issues orders.
-    if (ev.button === 2 || ev.button === 1) {
-      panRef.current = { x: p.x, y: p.y };
-      return;
-    }
-
-    const tile = screenToTile(p.x, p.y, camRef.current);
-
-    // Placing a building consumes the click.
-    const placingKind = placingRef.current;
-    if (placingKind) {
-      const tx = Math.round(tile.x);
-      const ty = Math.round(tile.y);
-      if (canPlaceBuilding(world, placingKind, tx, ty)) {
-        const spec = BUILDINGS[placingKind];
-        if (canAfford(world, 0, spec.cost)) {
-          pay(world, 0, spec.cost);
-          const site = spawn(world, placingKind, 0, tx, ty, 0.01);
-          const builders = [...selectedRef.current]
-            .map((id) => world.entities.get(id))
-            .filter((e): e is Entity => !!e && e.kind === "villager");
-          if (builders.length === 0) {
-            notify(world, "No villager selected — the site will sit unbuilt.");
-          }
-          for (const b of builders) commandBuild(world, b, site.id);
-        } else {
-          notify(world, "Not enough resources.");
-        }
-      } else {
-        notify(world, "Can't build there.");
-      }
-      if (!ev.shiftKey) {
-        placingRef.current = null;
-        setPlacing(null);
-      }
-      return;
-    }
-
-    dragRef.current = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
-  }, []);
-
-  const onPointerMove = useCallback((ev: React.PointerEvent<HTMLCanvasElement>) => {
-    const p = localPoint(ev);
-    hoverRef.current = screenToTile(p.x, p.y, camRef.current);
-
-    if (panRef.current) {
-      camRef.current.ox += p.x - panRef.current.x;
-      camRef.current.oy += p.y - panRef.current.y;
-      panRef.current = { x: p.x, y: p.y };
-      return;
-    }
-    if (dragRef.current) {
-      dragRef.current.x1 = p.x;
-      dragRef.current.y1 = p.y;
-    }
-  }, []);
-
-  const onPointerUp = useCallback(
-    (ev: React.PointerEvent<HTMLCanvasElement>) => {
-      const world = worldRef.current;
-      if (!world) return;
-      const canvas = canvasRef.current!;
-      if (canvas.hasPointerCapture(ev.pointerId)) canvas.releasePointerCapture(ev.pointerId);
-
-      if (panRef.current) {
-        panRef.current = null;
-        return;
-      }
-
-      const box = dragRef.current;
-      dragRef.current = null;
-      if (!box) return;
-
-      const p = localPoint(ev);
-      const dragged = Math.hypot(p.x - box.x0, p.y - box.y0) > 6;
-
-      if (dragged) {
-        // Marquee: select own units whose screen position falls inside.
-        const x0 = Math.min(box.x0, p.x);
-        const x1 = Math.max(box.x0, p.x);
-        const y0 = Math.min(box.y0, p.y);
-        const y1 = Math.max(box.y0, p.y);
-        const next = ev.shiftKey ? new Set(selectedRef.current) : new Set<number>();
-        for (const e of world.entities.values()) {
-          if (e.owner !== 0 || !isUnit(e.kind)) continue;
-          const { sx, sy } = tileToScreen(e.x, e.y, camRef.current);
-          if (sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1) next.add(e.id);
-        }
-        selectedRef.current = next;
-        publishHud();
-        return;
-      }
-
-      const tile = screenToTile(p.x, p.y, camRef.current);
-      const hit = entityAt(world, tile.x, tile.y);
-      const selected = [...selectedRef.current]
-        .map((id) => world.entities.get(id))
-        .filter((e): e is Entity => !!e && e.owner === 0 && isUnit(e.kind));
-
-      // With own units selected, a click on something is an order, not a
-      // reselection — that's the interaction people expect from the genre.
-      if (selected.length > 0 && hit && hit.owner === 1) {
-        for (const u of selected) commandAttack(world, u, hit.id);
-        return;
-      }
-      if (selected.length > 0 && hit && hit.owner === 0 && isBuilding(hit.kind)) {
-        if (hit.progress !== 1) {
-          for (const u of selected) if (u.kind === "villager") commandBuild(world, u, hit.id);
-          return;
-        }
-      }
-      if (selected.length > 0 && !hit) {
-        const t = terrainAt(world.map, Math.round(tile.x), Math.round(tile.y));
-        const gatherable = t === TERRAIN_IDS.forest || t === TERRAIN_IDS.gold;
-        for (const u of selected) {
-          if (gatherable && u.kind === "villager") {
-            commandGather(world, u, Math.round(tile.x), Math.round(tile.y));
-          } else {
-            commandMove(world, u, tile.x, tile.y);
-          }
-        }
-        return;
-      }
-
-      // Otherwise it's a selection.
-      const next = ev.shiftKey ? new Set(selectedRef.current) : new Set<number>();
-      if (hit && hit.owner === 0) next.add(hit.id);
-      selectedRef.current = next;
-      publishHud();
-    },
-    [publishHud],
-  );
-
-  const onWheel = useCallback((ev: React.WheelEvent<HTMLCanvasElement>) => {
-    const cam = camRef.current;
-    const p = localPoint(ev);
-    const before = screenToTile(p.x, p.y, cam);
-    cam.zoom = Math.max(0.45, Math.min(2.2, cam.zoom * (ev.deltaY < 0 ? 1.12 : 1 / 1.12)));
-    const after = screenToTile(p.x, p.y, cam);
-    // Keep the tile under the cursor fixed while zooming.
-    const { sx: bx, sy: by } = tileToScreen(before.x, before.y, cam);
-    const { sx: ax, sy: ay } = tileToScreen(after.x, after.y, cam);
-    cam.ox += ax - bx;
-    cam.oy += ay - by;
-  }, []);
-
-  // ---------------------------------------------------------------- actions
-  const train = useCallback(
-    (buildingId: number, kind: UnitKind) => {
-      const world = worldRef.current;
-      if (!world) return;
-      const b = world.entities.get(buildingId);
-      if (!b) return;
-      const err = enqueueTraining(world, b, kind);
-      if (err) notify(world, err);
-      publishHud();
-    },
-    [publishHud],
-  );
-
-  const startPlacing = useCallback((kind: BuildingKind) => {
-    placingRef.current = kind;
-    setPlacing(kind);
-  }, []);
-
-  const selectAllVillagers = useCallback(() => {
-    const world = worldRef.current;
-    if (!world) return;
-    const next = new Set<number>();
-    for (const e of world.entities.values()) {
-      if (e.owner === 0 && e.kind === "villager") next.add(e.id);
-    }
-    selectedRef.current = next;
-    publishHud();
-  }, [publishHud]);
-
-  const selectAllMilitary = useCallback(() => {
-    const world = worldRef.current;
-    if (!world) return;
-    const next = new Set<number>();
-    for (const e of world.entities.values()) {
-      if (e.owner === 0 && (e.kind === "spearman" || e.kind === "archer")) next.add(e.id);
-    }
-    selectedRef.current = next;
-    publishHud();
-  }, [publishHud]);
-
-  const focusTownCentre = useCallback(() => {
-    const world = worldRef.current;
+    // Wheel must be non-passive to stop the page itself from scrolling.
     const canvas = canvasRef.current;
-    if (!world || !canvas) return;
-    const tc = [...world.entities.values()].find(
-      (e) => e.owner === 0 && e.kind === "towncenter",
-    );
-    if (!tc) return;
-    centerOn(camRef.current, tc.x, tc.y, {
-      width: canvas.clientWidth,
-      height: canvas.clientHeight,
-    });
-    selectedRef.current = new Set([tc.id]);
-    publishHud();
-  }, [publishHud]);
+    canvas?.addEventListener("wheel", input.wheel, { passive: false });
+
+    // A development-only handle for driving the simulation from the console
+    // and from automated checks. Stripped from production builds.
+    if (process.env.NODE_ENV !== "production") {
+      (window as unknown as { __emberhold: unknown }).__emberhold = {
+        world: () => worldRef.current,
+        input,
+        spawn: (kind: Parameters<typeof spawn>[1], owner: 0 | 1, x: number, y: number) =>
+          spawn(worldRef.current, kind, owner, x, y),
+        camera: camRef.current,
+        advance(seconds: number) {
+          const world = worldRef.current;
+          for (let i = 0; i < Math.round(seconds / TICK); i++) {
+            tick(world, TICK);
+            tickAi(world, TICK, 1);
+          }
+          scanAlerts();
+          dirtyRef.current = true;
+        },
+      };
+    }
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", input.keyUp);
+      window.removeEventListener("pointermove", input.trackMouse);
+      document.documentElement.removeEventListener("mouseleave", input.mouseLeftWindow);
+      window.removeEventListener("blur", onBlur);
+      canvas?.removeEventListener("wheel", input.wheel);
+    };
+  }, [input, newGame, publish, scanAlerts]);
+
+  const togglePause = useCallback(() => {
+    if (!startedRef.current) return;
+    pausedRef.current = !pausedRef.current;
+    dirtyRef.current = true;
+  }, []);
+
+  const begin = useCallback(
+    (difficulty: Difficulty) => {
+      // A fresh world for the chosen level, so the AI's plan starts at zero.
+      newGame(difficulty, true);
+    },
+    [newGame],
+  );
+
+  // A minimap needs the live world and camera, not a React snapshot.
+  const minimapSource = useCallback(
+    () => ({
+      world: worldRef.current,
+      corners: viewCorners(camRef.current, view()),
+      selected: input.selected,
+      alerts: alertsRef.current
+        .filter((a) => worldRef.current.time - a.at < 6)
+        .map((a) => ({ x: a.x, y: a.y, age: worldRef.current.time - a.at })),
+    }),
+    [input, view],
+  );
+
+  const touched = useCallback(() => {
+    dirtyRef.current = true;
+  }, []);
 
   return {
     canvasRef,
     hud,
-    placing,
+    input,
     newGame,
-    train,
-    startPlacing,
-    selectAllVillagers,
-    selectAllMilitary,
-    focusTownCentre,
-    handlers: { onPointerDown, onPointerMove, onPointerUp, onWheel },
+    begin,
+    togglePause,
+    minimapSource,
+    touched,
   };
 }

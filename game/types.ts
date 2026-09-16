@@ -71,6 +71,8 @@ export interface Entity {
    * handle the second.
    */
   repathAt?: number;
+  /** Failed attempts to get beside the current resource tile. */
+  gatherRetries?: number;
 }
 
 export interface MatchStats {
@@ -179,7 +181,7 @@ interface EffectBase {
 export type Effect =
   | (EffectBase & { kind: "projectile"; tx: number; ty: number; owner: Owner })
   /** `owner` is the side that was hit — what "you are under attack" keys on. */
-  | (EffectBase & { kind: "impact"; owner: Owner })
+  | (EffectBase & { kind: "impact"; owner: Owner; targetKind: EntityKind })
   /** Order confirmation. Emitted by the input layer, not the rules. */
   | (EffectBase & { kind: "marker"; order: "move" | "attack" | "gather" | "build" | "rally" })
   | (EffectBase & { kind: "death"; owner: Owner })

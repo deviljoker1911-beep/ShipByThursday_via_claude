@@ -78,6 +78,16 @@ function octile(dx: number, dy: number): number {
   return ax > ay ? ax - ay + SQRT2 * ay : ay - ax + SQRT2 * ax;
 }
 
+/**
+ * `near`, when given, marks tiles that are as good as the goal — standing
+ * next to a tree, beside a building, in bow range of a target.
+ *
+ * It matters a great deal for speed. Those goals are usually impassable, so a
+ * search for the goal tile itself can never succeed: A* floods every
+ * reachable tile on the map before settling for the closest one. Profiled,
+ * that made pathfinding over half of all simulation time, most of it spent
+ * finding the spot next to a bush.
+ */
 export function findPath(
   map: GameMap,
   sx: number,
@@ -85,6 +95,7 @@ export function findPath(
   gx: number,
   gy: number,
   blocked?: Blocked,
+  near?: (x: number, y: number) => boolean,
 ): { x: number; y: number }[] {
   const startX = Math.round(sx);
   const startY = Math.round(sy);
@@ -92,6 +103,20 @@ export function findPath(
   const goalY = Math.round(gy);
 
   if (startX === goalX && startY === goalY) return [];
+
+  // With no explicit notion of "near enough", an impassable goal tile is
+  // reached by standing beside it.
+  const goalBlocked = !(
+    inBounds(map, goalX, goalY) &&
+    passable(map, goalX, goalY) &&
+    !blocked?.has(goalX, goalY)
+  );
+  const accept =
+    near ??
+    (goalBlocked
+      ? (x: number, y: number) => Math.max(Math.abs(x - goalX), Math.abs(y - goalY)) <= 1
+      : null);
+  if (accept?.(startX, startY)) return [];
 
   const W = map.width;
   const open = new Heap();
@@ -122,7 +147,7 @@ export function findPath(
     const cx = current % W;
     const cy = (current - cx) / W;
 
-    if (cx === goalX && cy === goalY) {
+    if ((cx === goalX && cy === goalY) || accept?.(cx, cy)) {
       bestKey = current;
       bestH = 0;
       break;

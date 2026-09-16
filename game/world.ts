@@ -417,10 +417,14 @@ export function repath(
   e: Entity,
   tx: number,
   ty: number,
+  target?: Entity,
+  reach = 1.0,
 ): "ok" | "cooldown" | "unreachable" {
   if ((e.repathAt ?? 0) > world.time) return "cooldown";
   e.repathAt = world.time + 0.6;
-  e.path = findPath(world.map, e.x, e.y, tx, ty, buildingBlocker(world));
+  e.path = target
+    ? pathTo(world, e, target, reach)
+    : findPath(world.map, e.x, e.y, tx, ty, buildingBlocker(world));
   return e.path.length > 0 ? "ok" : "unreachable";
 }
 
@@ -574,7 +578,7 @@ export function commandRepair(world: World, e: Entity, targetId: number) {
   const t = world.entities.get(targetId);
   if (!t || !isBuilding(t.kind)) return;
   e.state = { name: "repairing", targetId };
-  e.path = findPath(world.map, e.x, e.y, t.x, t.y, buildingBlocker(world));
+  e.path = pathTo(world, e, t, 1.0);
 }
 
 /** Append an order instead of replacing the current one (shift-click). */
@@ -591,14 +595,30 @@ export function commandGather(world: World, e: Entity, tileX: number, tileY: num
   const resource = RESOURCE_OF[t];
   if (!resource || world.map.amount[idx(world.map, tileX, tileY)] <= 0) return;
   e.state = { name: "gathering", tileX, tileY, resource };
-  e.path = findPath(world.map, e.x, e.y, tileX, tileY, buildingBlocker(world));
+  // Same test the gathering state uses to decide it has arrived, so the path
+  // and the arrival check can never disagree.
+  e.path = findPath(world.map, e.x, e.y, tileX, tileY, buildingBlocker(world), (x, y) =>
+    Math.max(Math.abs(x - tileX), Math.abs(y - tileY)) <= 1,
+  );
+}
+
+/** A path that ends within `reach` of an entity's edge. */
+export function pathTo(world: World, e: Entity, target: Entity, reach: number) {
+  return findPath(world.map, e.x, e.y, target.x, target.y, buildingBlocker(world), (x, y) =>
+    distanceTo(target, x, y) <= reach,
+  );
 }
 
 export function commandAttack(world: World, e: Entity, targetId: number) {
   if (!isUnit(e.kind)) return;
   e.state = { name: "attacking", targetId };
   const t = world.entities.get(targetId);
-  if (t) e.path = findPath(world.map, e.x, e.y, t.x, t.y, buildingBlocker(world));
+  if (t) e.path = pathTo(world, e, t, attackReach(e));
+}
+
+/** How close a path needs to get before an attacker can swing or shoot. */
+function attackReach(e: Entity): number {
+  return Math.max(0.8, attackRangeOf(e.kind) - 0.4);
 }
 
 export function commandBuild(world: World, e: Entity, targetId: number) {
@@ -606,7 +626,7 @@ export function commandBuild(world: World, e: Entity, targetId: number) {
   const t = world.entities.get(targetId);
   if (!t) return;
   e.state = { name: "building", targetId };
-  e.path = findPath(world.map, e.x, e.y, t.x, t.y, buildingBlocker(world));
+  e.path = pathTo(world, e, t, 1.0);
 }
 
 export function enqueueTraining(world: World, building: Entity, kind: UnitKind): string | null {
@@ -658,7 +678,12 @@ function tickBuilding(world: World, e: Entity, dt: number) {
     const foe = nearestEnemy(world, e, attackRangeOf(e.kind));
     if (foe && e.attackCd === 0) {
       e.attackCd = attackSpeedOf(e.kind);
-      strike(world, e, foe);
+      // One arrow, plus one for every villager sheltering beside it — up to
+      // five. That is what gives the alarm teeth: a town centre with its
+      // workers pulled in is a real defence rather than a slow death.
+      const arrows = 1 + Math.min(5, shelteredAt(world, e));
+      const foes = enemiesInRange(world, e, attackRangeOf(e.kind)).slice(0, arrows);
+      for (let i = 0; i < arrows; i++) strike(world, e, foes[i % foes.length] ?? foe);
     }
   }
 
@@ -835,18 +860,31 @@ function tickUnit(world: World, e: Entity, dt: number) {
 
       if (!adjacent) {
         const arrived = stepAlongPath(world, e, spec.speed, dt);
-        // Path spent and still not adjacent: this is as close as the terrain
-        // allows. Look for another tile rather than standing here forever.
         if (arrived) {
-          const next = nearestResourceTile(world.map, state.resource, e.x, e.y);
-          if (next && (next.x !== state.tileX || next.y !== state.tileY)) {
-            commandGather(world, e, next.x, next.y);
+          if ((e.repathAt ?? 0) > world.time) break;
+          e.repathAt = world.time + 0.4;
+          // Path spent and still not beside the tile. Usually that's another
+          // villager standing in the only free spot, not an unreachable
+          // resource. Measured in play: one of four villagers on a forage
+          // patch went idle within thirty seconds exactly this way. So try
+          // again, then try a different tile in the patch, and only give up
+          // after repeated failures.
+          e.gatherRetries = (e.gatherRetries ?? 0) + 1;
+          const same = (t: { x: number; y: number }) => t.x === state.tileX && t.y === state.tileY;
+          const tiles = resourceTilesNear(world.map, state.resource, e.x, e.y, 8, 12);
+          const pick = e.gatherRetries <= 1
+            ? tiles.find(same) ?? tiles[0]
+            : tiles[(e.gatherRetries - 1) % Math.max(1, tiles.length)];
+          if (pick && e.gatherRetries <= 6) {
+            commandGather(world, e, pick.x, pick.y);
           } else {
+            e.gatherRetries = 0;
             e.state = { name: "idle" };
           }
         }
         break;
       }
+      e.gatherRetries = 0;
       e.path = [];
       if (e.gatherCd! > 0) break;
       e.gatherCd = 1 / GATHER_RATE;
@@ -869,7 +907,7 @@ function tickUnit(world: World, e: Entity, dt: number) {
         const drop = nearestDropOff(world, e);
         if (drop) {
           e.state = { name: "returning", resource: state.resource };
-          e.path = findPath(world.map, e.x, e.y, drop.x, drop.y, buildingBlocker(world));
+          e.path = pathTo(world, e, drop, 1.0);
           // Remember where we were working so we can come back.
           e.workTile = { x: state.tileX, y: state.tileY };
         }
@@ -884,7 +922,7 @@ function tickUnit(world: World, e: Entity, dt: number) {
         break;
       }
       if (distanceTo(drop, e.x, e.y) > 1.2) {
-        if (!e.path?.length && repath(world, e, drop.x, drop.y) === "unreachable") {
+        if (!e.path?.length && repath(world, e, drop.x, drop.y, drop) === "unreachable") {
           // Nowhere to deliver. Keep the load and stop, rather than recomputing
           // an impossible path thirty times a second.
           e.state = { name: "idle" };
@@ -964,7 +1002,7 @@ function tickUnit(world: World, e: Entity, dt: number) {
       const reach = attackRangeOf(e.kind);
       const d = distanceTo(target, e.x, e.y);
       if (d > reach) {
-        if (!e.path?.length && repath(world, e, target.x, target.y) === "unreachable") {
+        if (!e.path?.length && repath(world, e, target.x, target.y, target, attackReach(e)) === "unreachable") {
           nextOrder(world, e);
           break;
         }
@@ -990,7 +1028,7 @@ function tickUnit(world: World, e: Entity, dt: number) {
         break;
       }
       if (distanceTo(target, e.x, e.y) > 1.2) {
-        if (!e.path?.length && repath(world, e, target.x, target.y) === "unreachable") {
+        if (!e.path?.length && repath(world, e, target.x, target.y, target) === "unreachable") {
           nextOrder(world, e);
           break;
         }
@@ -1090,6 +1128,7 @@ function resolveHits(world: World) {
       t: world.time,
       life: 0.22,
       owner: target.owner,
+      targetKind: target.kind,
     });
   }
 
@@ -1112,7 +1151,7 @@ function resolveHits(world: World) {
 function commandAttackKeepQueue(world: World, e: Entity, targetId: number) {
   e.state = { name: "attacking", targetId };
   const t = world.entities.get(targetId);
-  if (t) e.path = findPath(world.map, e.x, e.y, t.x, t.y, buildingBlocker(world));
+  if (t) e.path = pathTo(world, e, t, attackReach(e));
 }
 
 /** Closest hostile entity within `range`, measured to its edge. */
@@ -1128,6 +1167,21 @@ export function nearestEnemy(world: World, e: Entity, range: number): Entity | n
     }
   }
   return best;
+}
+
+function shelteredAt(world: World, b: Entity): number {
+  let n = 0;
+  for (const v of world.entities.values()) {
+    if (v.owner !== b.owner || v.kind !== "villager" || v.state?.name !== "idle") continue;
+    if (distanceTo(b, v.x, v.y) <= 1.3) n++;
+  }
+  return n;
+}
+
+function enemiesInRange(world: World, e: Entity, range: number): Entity[] {
+  return [...world.entities.values()]
+    .filter((o) => o.owner !== e.owner && distanceTo(o, e.x, e.y) <= range)
+    .sort((a, b) => distanceTo(a, e.x, e.y) - distanceTo(b, e.x, e.y));
 }
 
 /**

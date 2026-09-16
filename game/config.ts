@@ -159,8 +159,11 @@ export const BUILDINGS: Record<BuildingKind, BuildingSpec> = {
   towncenter: {
     name: "Town Centre",
     role: "Trains villagers. Drop-off point. Lose it and you lose.",
-    hp: 900,
-    armour: 2,
+    // Measured: at 900 HP and armour 2, six melee units razed it in about
+    // sixteen seconds, and a passive player lost at 2:37. It has to survive
+    // long enough for a player to notice and respond.
+    hp: 1800,
+    armour: 3,
     size: 3,
     sight: 11,
     cost: { wood: 300 },

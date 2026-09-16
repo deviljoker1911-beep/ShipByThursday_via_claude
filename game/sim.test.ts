@@ -175,20 +175,39 @@ test("combat kills, and the loser is removed from the world", () => {
 });
 
 test("destroying the last town centre ends the match", () => {
+  // This checks the win rule, not the balance of an assault — a defended town
+  // centre is meant to be hard to break. So bring it nearly down first and
+  // let a single blow finish it.
   const world = createWorld(41);
   const enemyTc = [...world.entities.values()].find(
     (e) => e.owner === 1 && e.kind === "towncenter",
   )!;
   assert.equal(world.outcome, "playing");
 
-  // Stand a squad next to it rather than walking them across the map.
-  for (let i = 0; i < 8; i++) {
-    const s = spawn(world, "spearman", 0, enemyTc.x + 2 + i * 0.1, enemyTc.y + 2);
-    commandAttack(world, s, enemyTc.id);
-  }
-  run(world, 120);
+  enemyTc.hp = 5;
+  const s = spawn(world, "spearman", 0, enemyTc.x + 2, enemyTc.y + 2);
+  commandAttack(world, s, enemyTc.id);
+  run(world, 20);
 
-  assert.equal(world.outcome, "won", "match did not resolve");
+  assert.equal(world.entities.has(enemyTc.id), false, "the town centre survived");
+  assert.equal(world.outcome, "won", "destroying it did not end the match");
+});
+
+test("a defended town centre holds against a small raid", () => {
+  // The balance half of the same question: with its villagers sheltering, a
+  // town centre should see off a handful of soldiers rather than fall in
+  // seconds, as it did at 900 HP.
+  const world = createWorld(41);
+  const tc = [...world.entities.values()].find((e) => e.owner === 0 && e.kind === "towncenter")!;
+  const raiders = [];
+  for (let i = 0; i < 4; i++) {
+    const r = spawn(world, "spearman", 1, tc.x + 3 + i * 0.3, tc.y + 3);
+    commandAttack(world, r, tc.id);
+    raiders.push(r);
+  }
+  run(world, 90);
+  assert.ok(world.entities.has(tc.id), "four spearmen razed a sheltered town centre");
+  assert.ok(raiders.every((r) => !world.entities.has(r.id)), "the raid wasn't repelled");
 });
 
 test("the AI actually develops: it gathers, builds and trains", () => {
