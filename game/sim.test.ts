@@ -37,18 +37,36 @@ test("isometric projection round-trips exactly", () => {
   }
 });
 
-test("every start has open ground and reachable wood and gold", () => {
-  // Generation is random; a start that can't gather is unplayable, so this
-  // needs to hold across many seeds, not just a lucky one.
-  for (let seed = 0; seed < 40; seed++) {
+test("every start has open ground and all four resources in reach", () => {
+  // Generation is random; a start that can't gather is unplayable, so this has
+  // to hold across many seeds, not just a lucky one. Four separate ordering
+  // bugs each broke it on roughly one map in fifty to one in a thousand —
+  // lanes erasing gold, the border erasing stone, later deposits overwriting
+  // earlier ones — so it is checked for every resource, on both starts.
+  for (let seed = 0; seed < 300; seed++) {
     const { map, starts } = generateMap(56, seed);
     for (const s of starts) {
       assert.ok(passable(map, s.x, s.y), `seed ${seed}: start not passable`);
-      const wood = nearestResourceTile(map, "wood", s.x, s.y, 14);
-      const gold = nearestResourceTile(map, "gold", s.x, s.y, 16);
-      assert.ok(wood, `seed ${seed}: no wood near start`);
-      assert.ok(gold, `seed ${seed}: no gold near start`);
+      for (const r of ["wood", "gold", "food", "stone"] as const) {
+        assert.ok(
+          nearestResourceTile(map, r, s.x, s.y, 10),
+          `seed ${seed}: no ${r} within reach of (${s.x},${s.y})`,
+        );
+      }
     }
+  }
+});
+
+test("maps are exactly fair: point-symmetric, starts included", () => {
+  for (let seed = 0; seed < 100; seed++) {
+    const { map, starts } = generateMap(56, seed);
+    const n = map.terrain.length;
+    for (let k = 0; k < n; k++) {
+      assert.equal(map.terrain[k], map.terrain[n - 1 - k], `seed ${seed}: terrain not mirrored`);
+      assert.equal(map.amount[k], map.amount[n - 1 - k], `seed ${seed}: amounts not mirrored`);
+    }
+    assert.equal(starts[0].x, map.width - 1 - starts[1].x);
+    assert.equal(starts[0].y, map.height - 1 - starts[1].y);
   }
 });
 

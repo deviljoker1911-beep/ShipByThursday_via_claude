@@ -168,6 +168,13 @@ export const BUILDINGS: Record<BuildingKind, BuildingSpec> = {
     trains: ["villager", "scout"],
     popBonus: 8,
     dropOff: true,
+    // A town centre that can't defend itself makes an early rush unanswerable:
+    // measured, five soldiers at minute two killed all thirteen of a
+    // defender's villagers inside sixty seconds. Modest arrows give the
+    // defender a place to retreat to, which turns a rush into a decision.
+    attack: 6,
+    range: 6,
+    attackSpeed: 2,
   },
   house: {
     name: "House",
@@ -202,7 +209,7 @@ export const BUILDINGS: Record<BuildingKind, BuildingSpec> = {
     cost: { wood: 55 },
     buildTime: 12,
     trains: [],
-    foodPerSecond: 0.55,
+    foodPerSecond: 0.75,
   },
   storehouse: {
     name: "Storehouse",
@@ -273,7 +280,15 @@ export function damageFrom(attackerKind: EntityKind, targetKind: EntityKind): nu
     : UNITS[attackerKind as UnitKind];
   const base = (isBuilding(attackerKind) ? spec.attack ?? 0 : (spec as UnitSpec).attack) ?? 0;
   const bonus = spec.bonusVs?.[armourClassOf(targetKind)] ?? 0;
-  return Math.max(1, base + bonus - armourOf(targetKind));
+  const raw = Math.max(1, base + bonus - armourOf(targetKind));
+  // Arrows barely scratch stone and timber. Without this, a mass of archers
+  // — already the best unit against infantry — also razed a town centre in
+  // under thirty seconds, and nothing else was worth building. Buildings are
+  // for melee to break.
+  if (attackRangeOf(attackerKind) > 2 && isBuilding(targetKind)) {
+    return Math.max(1, Math.round(raw * 0.25));
+  }
+  return raw;
 }
 
 export function attackRangeOf(kind: EntityKind): number {

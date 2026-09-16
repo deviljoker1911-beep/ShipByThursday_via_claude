@@ -18,6 +18,7 @@ import {
 } from "./config.ts";
 import { generateMap, idx, inBounds, passable, terrainAt } from "./map.ts";
 import { findPath } from "./pathfind.ts";
+import { updateVision } from "./fog.ts";
 import {
   TERRAIN_IDS,
   type BuildingKind,
@@ -27,7 +28,9 @@ import {
   type Owner,
   type Resource,
   type UnitKind,
+  type MatchStats,
   type UnitState,
+  type Vision,
   type World,
 } from "./types.ts";
 
@@ -63,6 +66,14 @@ export function createWorld(seed = Date.now()): World {
     outcome: "playing",
     notices: [],
     effects: [],
+    buildingVersion: 0,
+    terrainVersion: 0,
+    starts,
+    stats: { 0: blankStats(), 1: blankStats() },
+    vision: {
+      0: blankVision(map.width * map.height),
+      1: blankVision(map.width * map.height),
+    },
   };
 
   for (const owner of [0, 1] as Owner[]) {
@@ -81,7 +92,28 @@ export function createWorld(seed = Date.now()): World {
   }
 
   recomputePop(world);
+  updateVision(world, true);
   return world;
+}
+
+function blankStats(): MatchStats {
+  return {
+    gathered: { food: 0, wood: 0, gold: 0, stone: 0 },
+    unitsTrained: 0,
+    unitsLost: 0,
+    buildingsBuilt: 0,
+    buildingsLost: 0,
+    kills: 0,
+  };
+}
+
+function blankVision(size: number): Vision {
+  return {
+    explored: new Uint8Array(size),
+    visible: new Uint8Array(size),
+    ghosts: new Map(),
+    nextUpdate: 0,
+  };
 }
 
 export function spawn(
@@ -110,7 +142,18 @@ export function spawn(
     e.gatherCd = 0;
   }
   world.entities.set(e.id, e);
+  if (isBuilding(kind)) world.buildingVersion++;
   return e;
+}
+
+/** The one way anything leaves the world, so bookkeeping can't be skipped. */
+export function removeEntity(world: World, e: Entity, killer?: Entity) {
+  if (!world.entities.delete(e.id)) return;
+  if (isBuilding(e.kind)) world.buildingVersion++;
+  const loser = world.stats[e.owner];
+  if (isBuilding(e.kind)) loser.buildingsLost++;
+  else loser.unitsLost++;
+  if (killer && killer.owner !== e.owner) world.stats[killer.owner].kills++;
 }
 
 /** Top-left tile of a building's footprint. */
@@ -143,8 +186,18 @@ export function occupiesTile(e: Entity, x: number, y: number): boolean {
   return x >= x0 && y >= y0 && x < x0 + size && y < y0 + size;
 }
 
-/** Tiles blocked by buildings, rebuilt when a building is added or destroyed. */
+/**
+ * Tiles blocked by buildings.
+ *
+ * Cached against a version counter bumped whenever a building appears or is
+ * destroyed. It used to be rebuilt from scratch on every path request, which
+ * meant a twenty-unit move order rebuilt it twenty times in one click.
+ */
+const blockerCache = new WeakMap<World, { version: number; has: (x: number, y: number) => boolean }>();
+
 export function buildingBlocker(world: World) {
+  const cached = blockerCache.get(world);
+  if (cached && cached.version === world.buildingVersion) return cached;
   const blocked = new Set<number>();
   for (const e of world.entities.values()) {
     if (!isBuilding(e.kind)) continue;
@@ -155,7 +208,12 @@ export function buildingBlocker(world: World) {
       }
     }
   }
-  return { has: (x: number, y: number) => blocked.has(y * world.map.width + x) };
+  const result = {
+    version: world.buildingVersion,
+    has: (x: number, y: number) => blocked.has(y * world.map.width + x),
+  };
+  blockerCache.set(world, result);
+  return result;
 }
 
 export function canPlaceBuilding(
@@ -178,18 +236,26 @@ export function canPlaceBuilding(
   return true;
 }
 
+const RESOURCES: Resource[] = ["food", "wood", "gold", "stone"];
+
+/**
+ * Iterates every resource rather than naming them, because naming them is how
+ * stone got left out: the first version checked food, wood and gold only, so
+ * watchtowers were free of the one resource that was supposed to gate them.
+ */
 export function canAfford(world: World, owner: Owner, cost: Partial<Record<Resource, number>>) {
   const p = world.players[owner];
-  return (
-    (cost.food ?? 0) <= p.food && (cost.wood ?? 0) <= p.wood && (cost.gold ?? 0) <= p.gold
-  );
+  return RESOURCES.every((r) => (cost[r] ?? 0) <= p[r]);
 }
 
 export function pay(world: World, owner: Owner, cost: Partial<Record<Resource, number>>) {
   const p = world.players[owner];
-  p.food -= cost.food ?? 0;
-  p.wood -= cost.wood ?? 0;
-  p.gold -= cost.gold ?? 0;
+  for (const r of RESOURCES) p[r] -= cost[r] ?? 0;
+}
+
+export function refund(world: World, owner: Owner, cost: Partial<Record<Resource, number>>) {
+  const p = world.players[owner];
+  for (const r of RESOURCES) p[r] += cost[r] ?? 0;
 }
 
 export function recomputePop(world: World) {
@@ -247,8 +313,20 @@ export function applyState(world: World, e: Entity, state: UnitState) {
     case "moving":
     case "attackMove":
       e.state = state;
-      e.path = findPath(world.map, e.x, e.y, state.tx, state.ty, buildingBlocker(world));
+      e.path = finishAt(
+        world,
+        findPath(world.map, e.x, e.y, state.tx, state.ty, buildingBlocker(world)),
+        state.tx,
+        state.ty,
+      );
       break;
+    case "patrol": {
+      e.state = state;
+      const tx = state.toB ? state.bx : state.ax;
+      const ty = state.toB ? state.by : state.ay;
+      e.path = findPath(world.map, e.x, e.y, tx, ty, buildingBlocker(world));
+      break;
+    }
     case "gathering":
       commandGather(world, e, state.tileX, state.tileY);
       break;
@@ -327,13 +405,147 @@ export function entityAt(world: World, tx: number, ty: number): Entity | null {
   return null;
 }
 
+/**
+ * Ask for a new path, at most every so often.
+ *
+ * Returns "unreachable" when A* produced nothing, which every caller must treat
+ * as a reason to give up — standing still waiting for a path that will never
+ * exist is the freeze this codebase has now hit five times.
+ */
+export function repath(
+  world: World,
+  e: Entity,
+  tx: number,
+  ty: number,
+): "ok" | "cooldown" | "unreachable" {
+  if ((e.repathAt ?? 0) > world.time) return "cooldown";
+  e.repathAt = world.time + 0.6;
+  e.path = findPath(world.map, e.x, e.y, tx, ty, buildingBlocker(world));
+  return e.path.length > 0 ? "ok" : "unreachable";
+}
+
+/** Distinct tiles of a resource near a point, nearest first. */
+export function resourceTilesNear(
+  map: GameMap,
+  resource: Resource,
+  fromX: number,
+  fromY: number,
+  count: number,
+  maxRadius = 10,
+): { x: number; y: number }[] {
+  const wanted = TERRAIN_FOR[resource];
+  const found: { x: number; y: number }[] = [];
+  if (wanted === null) return found;
+  const cx = Math.round(fromX);
+  const cy = Math.round(fromY);
+  for (let r = 0; r < maxRadius && found.length < count; r++) {
+    for (let dy = -r; dy <= r && found.length < count; dy++) {
+      for (let dx = -r; dx <= r && found.length < count; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const x = cx + dx;
+        const y = cy + dy;
+        if (!inBounds(map, x, y)) continue;
+        if (terrainAt(map, x, y) === wanted && map.amount[idx(map, x, y)] > 0) {
+          found.push({ x, y });
+        }
+      }
+    }
+  }
+  return found;
+}
+
+export function resourceAt(map: GameMap, x: number, y: number): Resource | null {
+  const tx = Math.round(x);
+  const ty = Math.round(y);
+  if (!inBounds(map, tx, ty) || map.amount[idx(map, tx, ty)] <= 0) return null;
+  return RESOURCE_OF[terrainAt(map, tx, ty)] ?? null;
+}
+
+export function setRally(building: Entity, x: number, y: number) {
+  if (!isBuilding(building.kind)) return;
+  building.rally = { x, y };
+}
+
+/**
+ * New units head for the rally point — and a rally point on a resource means
+ * "go and work it", which is what makes rallying villagers worth doing.
+ */
+function sendToRally(world: World, unit: Entity, rally: { x: number; y: number }) {
+  const resource = resourceAt(world.map, rally.x, rally.y);
+  if (resource && unit.kind === "villager") {
+    const tile = nearestResourceTile(world.map, resource, rally.x, rally.y, 6) ?? {
+      x: Math.round(rally.x),
+      y: Math.round(rally.y),
+    };
+    commandGather(world, unit, tile.x, tile.y);
+    return;
+  }
+  commandMove(world, unit, rally.x, rally.y);
+}
+
+/** Remove a queued unit and give its cost back. */
+export function cancelTraining(world: World, building: Entity, index: number): boolean {
+  const item = building.queue?.[index];
+  if (!item) return false;
+  building.queue!.splice(index, 1);
+  refund(world, building.owner, UNITS[item.kind].cost);
+  return true;
+}
+
+/**
+ * Ring the alarm: every villager runs for the nearest defended building.
+ *
+ * Returns how many villagers responded. Their work tile is kept, so
+ * `backToWork` can send them straight back once the raid is over.
+ */
+export function soundAlarm(world: World, owner: Owner, near?: { x: number; y: number }, radius = Infinity): number {
+  // Buildings only. `isArmed` is true for every unit, and the first version
+  // used it alone — so each villager "fled" to the nearest villager, usually
+  // itself, and the alarm silently did nothing.
+  const shelters = [...world.entities.values()].filter(
+    (e) => e.owner === owner && isBuilding(e.kind) && (e.progress ?? 1) === 1 && isArmed(e.kind),
+  );
+  if (shelters.length === 0) return 0;
+  let count = 0;
+  for (const v of world.entities.values()) {
+    if (v.owner !== owner || v.kind !== "villager") continue;
+    if (near && Math.hypot(v.x - near.x, v.y - near.y) > radius) continue;
+    let best = shelters[0];
+    for (const s of shelters) {
+      if (distanceTo(s, v.x, v.y) < distanceTo(best, v.x, v.y)) best = s;
+    }
+    if (v.state?.name === "gathering") v.workTile = { x: v.state.tileX, y: v.state.tileY };
+    commandMove(world, v, best.x, best.y);
+    count++;
+  }
+  return count;
+}
+
+/** Send idle villagers back to whatever they were gathering before the alarm. */
+export function backToWork(world: World, owner: Owner): number {
+  let count = 0;
+  for (const v of world.entities.values()) {
+    if (v.owner !== owner || v.kind !== "villager" || v.state?.name !== "idle") continue;
+    const tile = v.workTile;
+    if (!tile || !resourceAt(world.map, tile.x, tile.y)) continue;
+    commandGather(world, v, tile.x, tile.y);
+    count++;
+  }
+  return count;
+}
+
+export function commandPatrol(world: World, e: Entity, bx: number, by: number) {
+  if (!isUnit(e.kind)) return;
+  e.orders = [];
+  applyState(world, e, { name: "patrol", ax: e.x, ay: e.y, bx, by, toB: true });
+}
+
 // ---------------------------------------------------------------- commands
 
 export function commandMove(world: World, e: Entity, tx: number, ty: number) {
   if (!isUnit(e.kind)) return;
   e.orders = [];
-  e.state = { name: "moving", tx, ty };
-  e.path = findPath(world.map, e.x, e.y, tx, ty, buildingBlocker(world));
+  applyState(world, e, { name: "moving", tx, ty });
 }
 
 /**
@@ -417,13 +629,17 @@ export function tick(world: World, dt: number) {
   if (world.outcome !== "playing") return;
   world.time += dt;
 
+  pendingHits = [];
   for (const e of [...world.entities.values()]) {
     if (isBuilding(e.kind)) tickBuilding(world, e, dt);
     else tickUnit(world, e, dt);
   }
+  // Every swing this tick lands together; see resolveHits.
+  resolveHits(world);
 
   separate(world);
   recomputePop(world);
+  updateVision(world);
   world.effects = world.effects.filter((fx) => world.time - fx.t < fx.life);
   checkOutcome(world);
 }
@@ -457,7 +673,8 @@ function tickBuilding(world: World, e: Entity, dt: number) {
   // Spawn just outside the footprint so the new unit isn't stuck inside it.
   const spot = findFreeTileNear(world, x0 + size / 2, y0 + size + 0.5);
   const unit = spawn(world, head.kind, e.owner, spot.x, spot.y);
-  if (e.rally) commandMove(world, unit, e.rally.x, e.rally.y);
+  world.stats[e.owner].unitsTrained++;
+  if (e.rally) sendToRally(world, unit, e.rally);
 }
 
 function findFreeTileNear(world: World, x: number, y: number) {
@@ -474,6 +691,17 @@ function findFreeTileNear(world: World, x: number, y: number) {
   return { x: Math.round(x), y: Math.round(y) };
 }
 
+/** Intermediate waypoints count as reached within this distance. */
+const WAYPOINT_SLACK = 0.45;
+
+/**
+ * Advance along the current path. Returns true when the path is used up.
+ *
+ * Intermediate waypoints only need to be *approached*, not touched. Requiring
+ * an exact hit meant four units sharing one waypoint in a narrow pass each
+ * crept 0.07 tiles toward it per tick while separation pushed them 0.27 away —
+ * they jittered on the spot for good.
+ */
 function stepAlongPath(world: World, e: Entity, speed: number, dt: number): boolean {
   if (!e.path || e.path.length === 0) return true;
   let budget = speed * dt;
@@ -482,6 +710,10 @@ function stepAlongPath(world: World, e: Entity, speed: number, dt: number): bool
     const dx = next.x - e.x;
     const dy = next.y - e.y;
     const d = Math.hypot(dx, dy);
+    if (e.path.length > 1 && d <= WAYPOINT_SLACK) {
+      e.path.shift();
+      continue;
+    }
     if (d <= budget) {
       e.x = next.x;
       e.y = next.y;
@@ -494,6 +726,70 @@ function stepAlongPath(world: World, e: Entity, speed: number, dt: number): bool
     }
   }
   return e.path.length === 0;
+}
+
+/** Per-unit progress tracking for the stuck detector. */
+const progress = new WeakMap<Entity, { path: unknown; best: number; since: number }>();
+
+/**
+ * Follow a path to a destination, and notice when that has stopped working.
+ *
+ * "arrived" also covers being close enough to the destination; "stuck" means
+ * no real progress for three seconds. Every freeze this codebase has had was
+ * a unit waiting for something that would never happen, and each was fixed
+ * individually. This is the general backstop: a unit that has stopped getting
+ * closer stops trying.
+ */
+function followPath(
+  world: World,
+  e: Entity,
+  tx: number,
+  ty: number,
+  speed: number,
+  dt: number,
+): "moving" | "arrived" | "stuck" {
+  const done = stepAlongPath(world, e, speed, dt);
+  const remaining = Math.hypot(tx - e.x, ty - e.y);
+  if (done || remaining < 0.3) {
+    // Clear what's left, or separation still treats the unit as travelling
+    // and it never steps aside for anyone.
+    e.path = [];
+    return "arrived";
+  }
+
+  let p = progress.get(e);
+  if (!p || p.path !== e.path) {
+    p = { path: e.path, best: remaining, since: world.time };
+    progress.set(e, p);
+  }
+  if (remaining < p.best - 0.1) {
+    p.best = remaining;
+    p.since = world.time;
+  } else if (world.time - p.since > 3) {
+    progress.delete(e);
+    e.path = [];
+    return "stuck";
+  }
+  return "moving";
+}
+
+/**
+ * End a path at the exact point asked for, not the tile it rounds to.
+ *
+ * A formation's slots are under a tile apart, so two of them can round to the
+ * same tile — and then two units share one final waypoint and only one of them
+ * can ever stand on it.
+ */
+export function finishAt(world: World, path: { x: number; y: number }[], tx: number, ty: number) {
+  if (!passable(world.map, Math.round(tx), Math.round(ty))) return path;
+  if (buildingBlocker(world).has(Math.round(tx), Math.round(ty))) return path;
+  const last = path[path.length - 1];
+  if (last && last.x === Math.round(tx) && last.y === Math.round(ty)) {
+    path[path.length - 1] = { x: tx, y: ty };
+  } else if (path.length > 0 || Math.hypot(tx - Math.round(tx), ty - Math.round(ty)) > 0) {
+    path.push({ x: tx, y: ty });
+  }
+  return path;
 }
 
 function tickUnit(world: World, e: Entity, dt: number) {
@@ -513,7 +809,9 @@ function tickUnit(world: World, e: Entity, dt: number) {
       break;
 
     case "moving":
-      if (stepAlongPath(world, e, spec.speed, dt)) nextOrder(world, e);
+      if (followPath(world, e, state.tx, state.ty, Math.min(spec.speed, state.speed ?? Infinity), dt) !== "moving") {
+        nextOrder(world, e);
+      }
       break;
 
     case "gathering": {
@@ -565,6 +863,7 @@ function tickUnit(world: World, e: Entity, dt: number) {
       if (world.map.amount[idx(world.map, state.tileX, state.tileY)] === 0) {
         // Felled trees become walkable ground.
         world.map.terrain[idx(world.map, state.tileX, state.tileY)] = TERRAIN_IDS.grass;
+        world.terrainVersion++;
       }
       if (e.carrying.amount >= CARRY_CAPACITY) {
         const drop = nearestDropOff(world, e);
@@ -585,14 +884,28 @@ function tickUnit(world: World, e: Entity, dt: number) {
         break;
       }
       if (distanceTo(drop, e.x, e.y) > 1.2) {
-        if (!e.path?.length) {
-          e.path = findPath(world.map, e.x, e.y, drop.x, drop.y, buildingBlocker(world));
+        if (!e.path?.length && repath(world, e, drop.x, drop.y) === "unreachable") {
+          // Nowhere to deliver. Keep the load and stop, rather than recomputing
+          // an impossible path thirty times a second.
+          e.state = { name: "idle" };
+          break;
         }
         stepAlongPath(world, e, spec.speed, dt);
         break;
       }
       if (e.carrying) {
         world.players[e.owner][e.carrying.resource] += e.carrying.amount;
+        world.stats[e.owner].gathered[e.carrying.resource] += e.carrying.amount;
+        emit(world, {
+          kind: "deposit",
+          x: drop.x,
+          y: drop.y,
+          t: world.time,
+          life: 1.1,
+          owner: e.owner,
+          text: `+${e.carrying.amount}`,
+          resource: e.carrying.resource,
+        });
         e.carrying = undefined;
       }
       // Back to the tile we were working, if it still has anything.
@@ -628,6 +941,15 @@ function tickUnit(world: World, e: Entity, dt: number) {
       target.hp = spec2.hp * (0.15 + 0.85 * target.progress);
       if (target.progress >= 1) {
         target.hp = spec2.hp;
+        world.stats[target.owner].buildingsBuilt++;
+        emit(world, {
+          kind: "complete",
+          x: target.x,
+          y: target.y,
+          t: world.time,
+          life: 1.2,
+          owner: target.owner,
+        });
         nextOrder(world, e);
       }
       break;
@@ -642,8 +964,9 @@ function tickUnit(world: World, e: Entity, dt: number) {
       const reach = attackRangeOf(e.kind);
       const d = distanceTo(target, e.x, e.y);
       if (d > reach) {
-        if (!e.path?.length) {
-          e.path = findPath(world.map, e.x, e.y, target.x, target.y, buildingBlocker(world));
+        if (!e.path?.length && repath(world, e, target.x, target.y) === "unreachable") {
+          nextOrder(world, e);
+          break;
         }
         stepAlongPath(world, e, spec.speed, dt);
         break;
@@ -652,7 +975,6 @@ function tickUnit(world: World, e: Entity, dt: number) {
       if (e.attackCd! > 0) break;
       e.attackCd = spec.attackSpeed;
       strike(world, e, target);
-      if (target.hp <= 0) nextOrder(world, e);
       break;
     }
 
@@ -668,8 +990,9 @@ function tickUnit(world: World, e: Entity, dt: number) {
         break;
       }
       if (distanceTo(target, e.x, e.y) > 1.2) {
-        if (!e.path?.length) {
-          e.path = findPath(world.map, e.x, e.y, target.x, target.y, buildingBlocker(world));
+        if (!e.path?.length && repath(world, e, target.x, target.y) === "unreachable") {
+          nextOrder(world, e);
+          break;
         }
         if (stepAlongPath(world, e, spec.speed, dt) && distanceTo(target, e.x, e.y) > 1.2) {
           nextOrder(world, e);
@@ -691,22 +1014,52 @@ function tickUnit(world: World, e: Entity, dt: number) {
         commandAttackKeepQueue(world, e, foe.id);
         break;
       }
-      if (stepAlongPath(world, e, spec.speed, dt)) nextOrder(world, e);
+      if (followPath(world, e, state.tx, state.ty, Math.min(spec.speed, state.speed ?? Infinity), dt) !== "moving") {
+        nextOrder(world, e);
+      }
+      break;
+    }
+
+    case "patrol": {
+      const foe = nearestEnemy(world, e, spec.sight);
+      if (foe) {
+        e.orders = [{ ...state }, ...(e.orders ?? [])];
+        commandAttackKeepQueue(world, e, foe.id);
+        break;
+      }
+      const legX = state.toB ? state.bx : state.ax;
+      const legY = state.toB ? state.by : state.ay;
+      if (followPath(world, e, legX, legY, spec.speed, dt) !== "moving") {
+        // Turn round at each end. A leg that can't be walked at all still
+        // flips, so a blocked patrol oscillates visibly instead of freezing.
+        applyState(world, e, { ...state, toB: !state.toB });
+      }
       break;
     }
   }
 }
 
 /**
- * Resolve one attack, including counters and armour.
+ * Swings taken this tick, resolved together once every entity has acted.
  *
- * Ranged attackers emit a projectile the renderer animates; the damage is
- * applied immediately regardless, so the simulation stays deterministic and
+ * Resolving each hit the moment it's thrown means whoever is processed first
+ * on the deciding tick kills the other before it can swing back. Measured
+ * with mirror duels, that decided the fight 23 times in 24 — first for player
+ * 0, and, after merely alternating the processing order, for whoever happened
+ * to land on the right parity. Simultaneous resolution removes the order from
+ * the outcome entirely: a unit that dies this tick still gets its swing.
+ */
+let pendingHits: { attacker: Entity; target: Entity }[] = [];
+
+/**
+ * Throw one attack. Damage lands at the end of the tick.
+ *
+ * Ranged attackers emit a projectile the renderer animates; the damage itself
+ * never waits on the animation, so the simulation stays deterministic and
  * independent of whether anything is drawing.
  */
 function strike(world: World, attacker: Entity, target: Entity) {
-  const range = attackRangeOf(attacker.kind);
-  if (range > 2) {
+  if (attackRangeOf(attacker.kind) > 2) {
     emit(world, {
       kind: "projectile",
       x: attacker.x,
@@ -718,10 +1071,31 @@ function strike(world: World, attacker: Entity, target: Entity) {
       owner: attacker.owner,
     });
   }
-  target.hp -= damageFrom(attacker.kind, target.kind);
-  emit(world, { kind: "impact", x: target.x, y: target.y, t: world.time, life: 0.22 });
+  pendingHits.push({ attacker, target });
+}
 
-  if (target.hp <= 0) {
+function resolveHits(world: World) {
+  const hits = pendingHits;
+  pendingHits = [];
+  const killer = new Map<number, Entity>();
+
+  for (const { attacker, target } of hits) {
+    if (!world.entities.has(target.id)) continue;
+    target.hp -= damageFrom(attacker.kind, target.kind);
+    killer.set(target.id, attacker);
+    emit(world, {
+      kind: "impact",
+      x: target.x,
+      y: target.y,
+      t: world.time,
+      life: 0.22,
+      owner: target.owner,
+    });
+  }
+
+  for (const [id, by] of killer) {
+    const target = world.entities.get(id);
+    if (!target || target.hp > 0) continue;
     emit(world, {
       kind: "death",
       x: target.x,
@@ -730,7 +1104,7 @@ function strike(world: World, attacker: Entity, target: Entity) {
       life: 0.6,
       owner: target.owner,
     });
-    world.entities.delete(target.id);
+    removeEntity(world, target, by);
   }
 }
 
@@ -776,6 +1150,7 @@ function autoAcquire(world: World, e: Entity, range: number) {
  */
 function separate(world: World) {
   const units = [...world.entities.values()].filter((e) => isUnit(e.kind));
+  const busy = (e: Entity) => (e.path?.length ?? 0) > 0;
   for (let i = 0; i < units.length; i++) {
     for (let j = i + 1; j < units.length; j++) {
       const a = units[i];
@@ -784,16 +1159,26 @@ function separate(world: World) {
       const dy = b.y - a.y;
       const d = Math.hypot(dx, dy);
       if (d >= SEPARATION || d === 0) continue;
-      const push = (SEPARATION - d) / 2;
+      const overlap = SEPARATION - d;
       const nx = dx / d;
       const ny = dy / d;
-      if (passable(world.map, Math.round(a.x - nx * push), Math.round(a.y - ny * push))) {
-        a.x -= nx * push;
-        a.y -= ny * push;
+      // A unit on its way somewhere shouldn't be shoved back by one standing
+      // still; the idle one steps aside. Two of a kind share the push. The
+      // push is also softer than a full overlap correction, so a unit moving
+      // through a crowd still makes headway.
+      const aShare = busy(a) === busy(b) ? 0.35 : busy(a) ? 0.1 : 0.6;
+      const bShare = busy(a) === busy(b) ? 0.35 : busy(b) ? 0.1 : 0.6;
+      const ax = a.x - nx * overlap * aShare;
+      const ay = a.y - ny * overlap * aShare;
+      const bx = b.x + nx * overlap * bShare;
+      const by = b.y + ny * overlap * bShare;
+      if (passable(world.map, Math.round(ax), Math.round(ay))) {
+        a.x = ax;
+        a.y = ay;
       }
-      if (passable(world.map, Math.round(b.x + nx * push), Math.round(b.y + ny * push))) {
-        b.x += nx * push;
-        b.y += ny * push;
+      if (passable(world.map, Math.round(bx), Math.round(by))) {
+        b.x = bx;
+        b.y = by;
       }
     }
   }

@@ -45,6 +45,24 @@ export function passable(map: GameMap, x: number, y: number): boolean {
   return t === TERRAIN_IDS.grass;
 }
 
+/**
+ * Tiles that later terrain must not overwrite: the lanes and the start area.
+ *
+ * Order used to decide what survived — a lane carved after a gold deposit
+ * simply erased it, which on some seeds left both starts with no gold at all.
+ * Protecting the lanes and placing resources around them removes the ordering
+ * problem entirely.
+ */
+let protectedTiles: Uint8Array | null = null;
+/** The start clearing alone — never overwritten, even by guaranteed resources. */
+let startTiles: Uint8Array | null = null;
+/**
+ * While set, every tile blob() places is claimed, so a later deposit can't
+ * land on it. Guaranteed resources are placed in sequence, and without this
+ * the forage placed after the gold would happily overwrite the gold.
+ */
+let claimPlaced = false;
+
 function blob(
   map: GameMap,
   cx: number,
@@ -61,6 +79,11 @@ function blob(
       const d = Math.hypot(x - cx, y - cy);
       // Fuzzy edge, so clusters don't read as perfect circles.
       if (d > radius * (0.72 + rand() * 0.45)) continue;
+      if (protectedTiles?.[idx(map, x, y)]) continue;
+      if (claimPlaced) {
+        if (protectedTiles) protectedTiles[idx(map, x, y)] = 1;
+        if (startTiles) startTiles[idx(map, x, y)] = 1;
+      }
       map.terrain[idx(map, x, y)] = id;
       map.amount[idx(map, x, y)] = amount;
     }
@@ -73,6 +96,8 @@ function clearArea(map: GameMap, cx: number, cy: number, r: number) {
       if (!inBounds(map, x, y)) continue;
       map.terrain[idx(map, x, y)] = TERRAIN_IDS.grass;
       map.amount[idx(map, x, y)] = 0;
+      if (protectedTiles) protectedTiles[idx(map, x, y)] = 1;
+      if (startTiles) startTiles[idx(map, x, y)] = 1;
     }
   }
 }
@@ -160,6 +185,82 @@ function carveLane(
         if (Math.hypot(x - cx, y - cy) > r) continue;
         map.terrain[idx(map, x, y)] = TERRAIN_IDS.grass;
         map.amount[idx(map, x, y)] = 0;
+        if (protectedTiles) protectedTiles[idx(map, x, y)] = 1;
+      }
+    }
+  }
+}
+
+/**
+ * Make the map point-symmetric by copying one half onto the other.
+ *
+ * Tile (x, y) mirrors to (W-1-x, H-1-y), which in row-major order is simply
+ * index N-1-k. The top half is kept and rotated onto the bottom half.
+ *
+ * Fairness has to be structural. The first version mirrored only gold and
+ * stone, while forests, forage and the "guaranteed" start resources were
+ * placed independently — and the same offsets that pointed toward the centre
+ * for one start pointed into the water border for the other.
+ */
+function mirror(map: GameMap) {
+  const n = map.terrain.length;
+  for (let k = 0; k < n / 2; k++) {
+    map.terrain[n - 1 - k] = map.terrain[k];
+    map.amount[n - 1 - k] = map.amount[k];
+  }
+}
+
+/**
+ * Protect every tile of a resource near a point.
+ *
+ * A guarantee can be met by a deposit that was already there, not only by one
+ * placed for it — and an unclaimed deposit is still fair game for whatever is
+ * placed next. That is how seed 10 lost its gold: satisfied by a random
+ * deposit, then overwritten by the guaranteed forage.
+ */
+function claimNear(map: GameMap, at: { x: number; y: number }, terrain: Terrain, r: number) {
+  const id = TERRAIN_IDS[terrain];
+  for (let y = Math.floor(at.y - r); y <= at.y + r; y++) {
+    for (let x = Math.floor(at.x - r); x <= at.x + r; x++) {
+      if (!inBounds(map, x, y) || Math.hypot(x - at.x, y - at.y) > r) continue;
+      const k = idx(map, x, y);
+      if (map.terrain[k] !== id) continue;
+      if (protectedTiles) protectedTiles[k] = 1;
+      if (startTiles) startTiles[k] = 1;
+    }
+  }
+}
+
+function countNear(map: GameMap, at: { x: number; y: number }, terrain: Terrain, r: number): number {
+  const id = TERRAIN_IDS[terrain];
+  let n = 0;
+  for (let y = Math.floor(at.y - r); y <= at.y + r; y++) {
+    for (let x = Math.floor(at.x - r); x <= at.x + r; x++) {
+      if (!inBounds(map, x, y) || Math.hypot(x - at.x, y - at.y) > r) continue;
+      if (map.terrain[idx(map, x, y)] === id) n++;
+    }
+  }
+  return n;
+}
+
+/** A straight corridor. Straight, so a corridor between mirrored points is itself symmetric. */
+function carveStraight(
+  map: GameMap,
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  width: number,
+) {
+  const steps = Math.ceil(Math.hypot(to.x - from.x, to.y - from.y) * 2);
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const cx = from.x + (to.x - from.x) * t;
+    const cy = from.y + (to.y - from.y) * t;
+    for (let y = Math.floor(cy - width); y <= cy + width; y++) {
+      for (let x = Math.floor(cx - width); x <= cx + width; x++) {
+        if (x < 1 || y < 1 || x >= map.width - 1 || y >= map.height - 1) continue;
+        if (Math.hypot(x - cx, y - cy) > width) continue;
+        map.terrain[idx(map, x, y)] = TERRAIN_IDS.grass;
+        map.amount[idx(map, x, y)] = 0;
       }
     }
   }
@@ -174,73 +275,107 @@ export function generateMap(size = 56, seed = Date.now()): GeneratedMap {
     amount: new Uint16Array(size * size),
   };
 
-  // Players start on opposite corners of the diagonal, which in isometric
-  // projection reads as left and right rather than top and bottom.
+  // Starts are exact mirror images of each other. Start 1 sits in the half
+  // that is kept; start 0 is its reflection.
   const inset = Math.floor(size * 0.16);
-  const starts = [
-    { x: inset, y: size - inset },
-    { x: size - inset, y: inset },
-  ];
+  const kept = { x: size - 1 - inset, y: inset };
+  const starts = [{ x: size - 1 - kept.x, y: size - 1 - kept.y }, kept];
 
-  // Forage: the early food supply. Scattered, so expanding toward it is a
-  // real decision rather than a formality.
+  protectedTiles = new Uint8Array(size * size);
+  startTiles = new Uint8Array(size * size);
+
+  // Reserve the border before anything is placed. It is painted with water at
+  // the end, and deposits that landed on it were silently erased then — after
+  // the start-resource check had already counted them as present. One seed in
+  // fifty ended with no stone near either base because of exactly that.
+  for (let i = 0; i < size; i++) {
+    for (const k of [idx(map, i, 0), idx(map, i, size - 1), idx(map, 0, i), idx(map, size - 1, i)]) {
+      protectedTiles[k] = 1;
+      startTiles[k] = 1;
+    }
+  }
+
+  // Structure first: the start area and the lanes. Everything placed after
+  // this flows around them.
+  const s = kept;
+  clearArea(map, s.x, s.y, 4);
+  // Lanes to the centre and round both flanks. Mirroring completes each one
+  // on the other side. The narrow flanks are worth defending and the centre
+  // is worth contesting — geography creating decisions, authored by nobody.
+  const mid = { x: (size - 1) / 2, y: (size - 1) / 2 };
+  carveLane(map, kept, mid, 2.6, rand);
+  carveLane(map, kept, { x: size * 0.25, y: size * 0.2 }, 1.5, rand);
+  carveLane(map, { x: size * 0.25, y: size * 0.2 }, { x: size * 0.12, y: size * 0.45 }, 1.5, rand);
+  carveLane(map, kept, { x: size * 0.85, y: size * 0.45 }, 1.5, rand);
+
+  // Then the wild map. Only the top half matters; the bottom is overwritten
+  // by its reflection.
   for (let i = 0; i < Math.floor(size * 0.22); i++) {
     blob(map, rand() * size, rand() * size, 1.3 + rand() * 1.4, "forage", rand);
   }
-
-  // Forests: many small clusters.
   for (let i = 0; i < Math.floor(size * 0.7); i++) {
     blob(map, rand() * size, rand() * size, 2 + rand() * 3.5, "forest", rand);
   }
-
-  // Gold and stone: fewer, and mirrored so neither player is starved.
   for (let i = 0; i < 5; i++) {
-    const x = rand() * size;
-    const y = rand() * size;
-    blob(map, x, y, 1.4 + rand(), "gold", rand);
-    blob(map, size - x, size - y, 1.4 + rand(), "gold", rand);
+    blob(map, rand() * size, rand() * size * 0.5, 1.4 + rand(), "gold", rand);
   }
   for (let i = 0; i < 3; i++) {
-    const x = rand() * size;
-    const y = rand() * size;
-    blob(map, x, y, 1.3, "stone", rand);
-    blob(map, size - x, size - y, 1.3, "stone", rand);
+    blob(map, rand() * size, rand() * size * 0.5, 1.3, "stone", rand);
   }
+  // A lake for interest, off the centre line so it can't wall the map.
+  blob(map, rand() * size * 0.3, rand() * size * 0.3, 2.5 + rand() * 2, "water", rand);
 
-  // A lake or two for visual interest, kept away from the middle so they can't
-  // wall the map in half.
-  for (let i = 0; i < 2; i++) {
-    const x = rand() < 0.5 ? rand() * size * 0.3 : size - rand() * size * 0.3;
-    const y = rand() < 0.5 ? rand() * size * 0.3 : size - rand() * size * 0.3;
-    blob(map, x, y, 2.5 + rand() * 2, "water", rand);
+  // Guaranteed resources around the start — verified, not assumed. Each is
+  // tried at successive angles until enough of it actually landed within
+  // reach, because a start without trees or gold isn't a hard opening, it's
+  // an unplayable one.
+  const guaranteed: [Terrain, number, number][] = [
+    ["forest", 2.6, 14],
+    ["gold", 1.6, 5],
+    ["forage", 1.8, 6],
+    ["stone", 1.3, 3],
+  ];
+  // The backstop corridor, if it's ever needed, runs from this start straight
+  // at the centre. Guaranteed resources keep out of that bearing so the
+  // backstop can never erase them.
+  const corridor = Math.atan2(mid.y - s.y, mid.x - s.x);
+  const clearOfCorridor = (angle: number) => {
+    const d = Math.abs(Math.atan2(Math.sin(angle - corridor), Math.cos(angle - corridor)));
+    return d > 0.45;
+  };
+
+  const tryPlace = (terrain: Terrain, radius: number, minTiles: number) => {
+    const base = rand() * Math.PI * 2;
+    for (let a = 0; a < 16 && countNear(map, s, terrain, 9) < minTiles; a++) {
+      const angle = base + (a * Math.PI * 2) / 16;
+      if (!clearOfCorridor(angle)) continue;
+      const dist = 5.2 + rand() * 1.6;
+      const cx = s.x + Math.cos(angle) * dist;
+      const cy = s.y + Math.sin(angle) * dist;
+      // Stay inside the kept half, clear of the border.
+      if (cy < 2 || cy > size / 2 - 3 || cx < 2 || cx > size - 3) continue;
+      blob(map, cx, cy, radius, terrain, rand);
+    }
+  };
+
+  claimPlaced = true;
+  for (const [terrain, radius, minTiles] of guaranteed) {
+    // First around the lanes...
+    tryPlace(terrain, radius, minTiles);
+    if (countNear(map, s, terrain, 9) >= minTiles) {
+      claimNear(map, s, terrain, 9);
+      continue;
+    }
+    // ...and if the lanes left no room, over their edges. The start clearing
+    // stays sacred, and the lanes are wide enough to survive a small deposit
+    // at one side. Measured, lanes alone left no room on about 1 map in 70.
+    const union: Uint8Array | null = protectedTiles;
+    protectedTiles = startTiles;
+    tryPlace(terrain, radius, minTiles);
+    protectedTiles = union;
+    claimNear(map, s, terrain, 9);
   }
-
-  // Each start needs open ground, plus guaranteed wood and gold within reach —
-  // a start with no nearby trees is unplayable, not a challenge.
-  for (const s of starts) {
-    clearArea(map, s.x, s.y, 4);
-    blob(map, s.x + 6, s.y - 1, 2.6, "forest", rand);
-    blob(map, s.x - 1, s.y + 6, 2.2, "forest", rand);
-    blob(map, s.x + 5, s.y + 5, 1.5, "gold", rand);
-    // Guaranteed food within reach. A start that can't feed itself isn't a
-    // hard opening, it's a dead one.
-    blob(map, s.x - 5, s.y + 1, 1.8, "forage", rand);
-    blob(map, s.x + 1, s.y - 5, 1.6, "forage", rand);
-    blob(map, s.x + 7, s.y + 2, 1.2, "stone", rand);
-    clearArea(map, s.x, s.y, 3);
-  }
-
-  // Three lanes between the bases: a wide central road and two narrower
-  // flanking passes. Besides guaranteeing the map is playable at all, this is
-  // what gives it shape — the narrow flanks are defensible, the centre is
-  // contested, and neither of those had to be authored by hand.
-  const mid = { x: size / 2, y: size / 2 };
-  carveLane(map, starts[0], mid, 2.6, rand);
-  carveLane(map, mid, starts[1], 2.6, rand);
-  carveLane(map, starts[0], { x: size * 0.22, y: size * 0.22 }, 1.5, rand);
-  carveLane(map, { x: size * 0.22, y: size * 0.22 }, starts[1], 1.5, rand);
-  carveLane(map, starts[0], { x: size * 0.78, y: size * 0.78 }, 1.5, rand);
-  carveLane(map, { x: size * 0.78, y: size * 0.78 }, starts[1], 1.5, rand);
+  claimPlaced = false;
 
   // Border of water, so units can't wander off the edge.
   for (let i = 0; i < size; i++) {
@@ -250,11 +385,14 @@ export function generateMap(size = 56, seed = Date.now()): GeneratedMap {
     }
   }
 
-  // Belt and braces: if the lanes still didn't join the two starts — a lake
-  // dropped across a pass, say — force a direct corridor. A map that fails
-  // this is unplayable, so it is not something to leave to chance.
+  mirror(map);
+  protectedTiles = null;
+  startTiles = null;
+
+  // Belt and braces: if the halves still don't join, a straight corridor
+  // through the centre is symmetric by construction.
   if (!isConnected(map, starts[0], starts[1])) {
-    carveLane(map, starts[0], starts[1], 2.2, rand);
+    carveStraight(map, starts[0], starts[1], 2.2);
   }
 
   return { map, starts };

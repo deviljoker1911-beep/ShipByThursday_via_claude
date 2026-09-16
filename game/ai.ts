@@ -6,8 +6,10 @@ import {
   commandAttackMove,
   commandBuild,
   commandGather,
+  commandMove,
   commandRepair,
   distanceTo,
+  soundAlarm,
   rand,
   enqueueTraining,
   nearestResourceTile,
@@ -15,6 +17,8 @@ import {
   spawn,
 } from "./world.ts";
 import type { ArmourClass } from "./config.ts";
+import { knownEnemyBuildings, tileExplored, visibleEnemies } from "./fog.ts";
+import { commandGroup } from "./formation.ts";
 import type { BuildingKind, Entity, Owner, Resource, UnitKind, World } from "./types.ts";
 
 /**
@@ -35,6 +39,14 @@ interface AiMemory {
   seen: Record<ArmourClass, number>;
   scoutId: number | null;
   scoutTarget: { x: number; y: number } | null;
+  /** Whether the scout has been to the enemy's starting position yet. */
+  scoutedStart: boolean;
+  /**
+   * Where enemy villagers were last seen working. Under fog the AI can't raid
+   * what it can't see, so it raids where it last saw them — which is exactly
+   * what a human does.
+   */
+  workerSightings: { x: number; y: number; at: number }[];
   /** Set while hostiles are near our own buildings. */
   defending: boolean;
 }
@@ -47,6 +59,8 @@ function blankMemory(): AiMemory {
     seen: { infantry: 0, ranged: 0, cavalry: 0, building: 0 },
     scoutId: null,
     scoutTarget: null,
+    scoutedStart: false,
+    workerSightings: [],
     defending: false,
   };
 }
@@ -75,14 +89,13 @@ export function resetAi() {
 }
 
 /**
- * What the AI is allowed to know.
+ * What the AI is allowed to know: enemies currently in its sight.
  *
- * Currently everything — there is no fog of war yet. It exists as a single
- * choke point so that when vision lands, restricting the AI to what it can
- * actually see is one function, not a hunt through the whole file.
+ * Nothing else. The AI plays under the same fog as the player — it finds the
+ * enemy base by scouting it, and attacks what it has seen or remembers.
  */
 function perceive(world: World, owner: Owner): Entity[] {
-  return [...world.entities.values()].filter((e) => e.owner !== owner);
+  return visibleEnemies(world, owner);
 }
 
 function mine(world: World, owner: Owner): Entity[] {
@@ -110,9 +123,13 @@ export function tickAi(world: World, dt: number, owner: Owner = 1) {
   const p = world.players[owner];
 
   observe(world, owner, memory);
-  staffConstruction(world, villagers, buildings);
-  keepVillagersWorking(world, villagers, p);
   defendIfAttacked(world, own, army, buildings, owner, memory);
+  // While a raid is on, sheltering villagers arrive idle; putting them back to
+  // work here would march them straight back into it.
+  if (!memory.defending) {
+    staffConstruction(world, villagers, buildings);
+    keepVillagersWorking(world, villagers, p);
+  }
   repairDamage(world, villagers, buildings);
   manageConstruction(world, tc, villagers, buildings, p, owner, memory);
   manageProduction(world, tc, barracks, villagers, owner, memory);
@@ -131,11 +148,25 @@ function observe(world: World, owner: Owner, memory: AiMemory) {
   for (const e of perceive(world, owner)) {
     if (isBuilding(e.kind)) {
       seen.building++;
-    } else if (e.kind !== "villager") {
+    } else if (e.kind === "villager") {
+      memory.workerSightings.push({ x: e.x, y: e.y, at: world.time });
+    } else if (e.kind === "scout") {
+      // Deliberately ignored. Counting a lone scout as "cavalry" once made the
+      // AI build nothing but spearmen against an army of archers, which
+      // counter spearmen — every unit it trained died on arrival.
+      continue;
+    } else {
       seen[UNITS[e.kind as UnitKind].armourClass]++;
     }
   }
-  memory.seen = seen;
+  // Under fog, a glimpse is all you get. Keep what was seen and let it fade,
+  // rather than forgetting an army the moment it steps out of sight.
+  for (const k of Object.keys(seen) as ArmourClass[]) {
+    memory.seen[k] = Math.max(memory.seen[k] * 0.97, seen[k]);
+  }
+  memory.workerSightings = memory.workerSightings
+    .filter((w) => world.time - w.at < 90)
+    .slice(-12);
 }
 
 /**
@@ -165,44 +196,68 @@ function staffConstruction(world: World, villagers: Entity[], buildings: Entity[
 }
 
 /**
- * An idle villager is how an AI loses a match without ever being fought.
+ * Keep the workforce matched to what the economy needs.
  *
- * Assignment follows whichever stockpile is thinnest relative to what the AI
- * spends it on, rather than a fixed ratio.
+ * Assigning only *idle* villagers is not enough: a gatherer carries on with
+ * the same resource forever, so whatever was assigned in the first minute
+ * stays assigned all match. Measured, that left one AI mining stone and wood
+ * with food stuck under 45 — it could never afford a single soldier. So each
+ * think, idle villagers go where they're most needed, and one busy villager is
+ * moved from the most over-staffed resource to the most under-staffed.
  */
-function keepVillagersWorking(world: World, villagers: Entity[], p: World["players"][Owner]) {
-  const idle = villagers.filter((v) => v.state?.name === "idle");
-  if (idle.length === 0) return;
+const SHARE: Record<Resource, number> = { food: 0.42, wood: 0.33, gold: 0.17, stone: 0.08 };
 
-  for (const v of idle) {
-    const want = neediestResource(p);
-    const tile = nearestResourceTile(world.map, want, v.x, v.y, 26);
-    if (tile) {
-      commandGather(world, v, tile.x, tile.y);
-      continue;
-    }
-    // Nothing of that kind in reach; take anything rather than stand still.
-    for (const alt of ["wood", "gold", "stone"] as Resource[]) {
-      const any = nearestResourceTile(world.map, alt, v.x, v.y, 30);
-      if (any) {
-        commandGather(world, v, any.x, any.y);
-        break;
-      }
-    }
+function keepVillagersWorking(world: World, villagers: Entity[], p: World["players"][Owner]) {
+  if (villagers.length === 0) return;
+
+  const working = (r: Resource) =>
+    villagers.filter(
+      (v) =>
+        (v.state?.name === "gathering" || v.state?.name === "returning") &&
+        v.state.resource === r,
+    );
+
+  // A big stockpile means that resource needs fewer hands right now.
+  const want = (r: Resource) => {
+    const glut = p[r] > 450 ? 0.4 : p[r] > 250 ? 0.75 : 1;
+    return SHARE[r] * glut;
+  };
+  const resources: Resource[] = ["food", "wood", "gold", "stone"];
+  const totalWant = resources.reduce((acc, r) => acc + want(r), 0);
+  const gap = (r: Resource) =>
+    (want(r) / totalWant) * villagers.length - working(r).length;
+  const neediest = () => [...resources].sort((a, b) => gap(b) - gap(a))[0];
+
+  for (const v of villagers.filter((v) => v.state?.name === "idle")) {
+    assign(world, v, neediest());
+  }
+
+  // One reassignment per think keeps the economy responsive without the
+  // whole workforce sloshing back and forth.
+  const short = neediest();
+  const surplus = [...resources].sort((a, b) => gap(a) - gap(b))[0];
+  if (gap(short) >= 1 && gap(surplus) <= -1) {
+    const mover = working(surplus).find((v) => !v.carrying || v.carrying.amount < 3);
+    if (mover) assign(world, mover, short);
   }
 }
 
-function neediestResource(p: World["players"][Owner]): Resource {
-  // Weighted by roughly how fast each is spent, so wood (buildings and
-  // archers) is treated as scarcer than stone (towers only).
-  const scores: [Resource, number][] = [
-    ["wood", p.wood / 260],
-    ["food", p.food / 240],
-    ["gold", p.gold / 150],
-    ["stone", p.stone / 120],
-  ];
-  scores.sort((a, b) => a[1] - b[1]);
-  return scores[0][0];
+function assign(world: World, v: Entity, want: Resource) {
+  const tile = nearestResourceTile(world.map, want, v.x, v.y, 26);
+  if (tile) {
+    v.orders = [];
+    commandGather(world, v, tile.x, tile.y);
+    return;
+  }
+  // Nothing of that kind in reach; take anything rather than stand still.
+  for (const alt of ["wood", "gold", "food", "stone"] as Resource[]) {
+    const any = nearestResourceTile(world.map, alt, v.x, v.y, 30);
+    if (any) {
+      v.orders = [];
+      commandGather(world, v, any.x, any.y);
+      return;
+    }
+  }
 }
 
 /** Pull the army home when hostiles reach our buildings. */
@@ -234,15 +289,16 @@ function defendIfAttacked(
   if (!memory.defending) return;
 
   const target = raiders[0];
+
+  // Outnumbered: get the workers out of the way first. Villagers left
+  // gathering beside a raiding party are the whole early game, lost.
+  if (army.length < raiders.length * 1.5) {
+    soundAlarm(world, owner, { x: target.x, y: target.y }, 14);
+  }
+
   for (const s of army) {
     if (s.state?.name === "attacking") continue;
     commandAttack(world, s, target.id);
-  }
-  // Villagers only join when there is nothing else left to defend with.
-  if (army.length === 0) {
-    for (const v of own.filter((e) => e.kind === "villager").slice(0, 4)) {
-      commandAttack(world, v, target.id);
-    }
   }
 }
 
@@ -291,7 +347,10 @@ function manageConstruction(
     return;
   }
   // Farms give food that never runs out, which matters once nearby game is gone.
-  if (done("farm") < 3 && villagers.length >= 6 && canAfford(world, owner, BUILDINGS.farm.cost)) {
+  // Farms are the food that doesn't run out; lean on them once forage is gone.
+  const forageLeft = nearestResourceTile(world.map, "food", tc.x, tc.y, 14) !== null;
+  const farmTarget = forageLeft ? 2 : 5;
+  if (done("farm") < farmTarget && villagers.length >= 6 && canAfford(world, owner, BUILDINGS.farm.cost)) {
     place(world, tc, "farm", villagers, 3, 6, owner);
     return;
   }
@@ -366,16 +425,30 @@ function manageScout(world: World, own: Entity[], tc: Entity, owner: Owner, memo
     return;
   }
 
-  // Wander between random corners of the map; it's crude, but it produces a
-  // unit that is visibly out looking for something.
-  if (scout.state?.name === "idle" || !memory.scoutTarget) {
-    const m = world.map;
-    memory.scoutTarget = {
-      x: 4 + rand(world) * (m.width - 8),
-      y: 4 + rand(world) * (m.height - 8),
-    };
-    commandAttackMove(world, scout, memory.scoutTarget.x, memory.scoutTarget.y);
+  if (scout.state?.name !== "idle" && memory.scoutTarget) return;
+
+  // First, where the enemy must have started — starting positions are public
+  // on a two-player map. After that, somewhere not yet seen. A scout sent to
+  // random points spends most of its life re-seeing its own base.
+  const enemyStart = world.starts[owner === 0 ? 1 : 0];
+  if (!memory.scoutedStart && enemyStart) {
+    memory.scoutedStart = true;
+    memory.scoutTarget = enemyStart;
+  } else {
+    memory.scoutTarget = unexploredSpot(world, owner);
   }
+  // A plain move, not attack-move: a scout that stops to fight stops scouting.
+  commandMove(world, scout, memory.scoutTarget.x, memory.scoutTarget.y);
+}
+
+function unexploredSpot(world: World, owner: Owner): { x: number; y: number } {
+  const m = world.map;
+  for (let attempt = 0; attempt < 24; attempt++) {
+    const x = 3 + Math.floor(rand(world) * (m.width - 6));
+    const y = 3 + Math.floor(rand(world) * (m.height - 6));
+    if (!tileExplored(world, owner, x, y)) return { x, y };
+  }
+  return { x: 3 + rand(world) * (m.width - 6), y: 3 + rand(world) * (m.height - 6) };
 }
 
 /** Commit when the army is worth committing, in waves that grow. */
@@ -390,13 +463,14 @@ function considerAttack(world: World, army: Entity[], owner: Owner, memory: AiMe
   const impatient = idleArmy >= needed && idleArmy >= army.length * 0.6;
   if ((memory.nextAttack > 0 && !impatient) || army.length < needed) return;
 
-  const targets = perceive(world, owner);
   // Objectives must be *static*. Sending a wave at a villager means sending it
   // after something that walks away, so the army chases one worker around the
   // map, the wave timer resets, and the enemy base is never actually attacked.
   // That single choice is the difference between a match that ends and one
   // that grinds on past the hour mark.
-  const structures = targets.filter((e) => isBuilding(e.kind));
+  // Buildings the AI has seen — now or before. Under fog, that is the only
+  // list it has; it cannot aim at a base it has never found.
+  const structures = knownEnemyBuildings(world, owner);
   // March at the town centre, not at the nearest useful building.
   //
   // Targeting the barracks seems smarter — it's the thing making the enemy
@@ -409,7 +483,10 @@ function considerAttack(world: World, army: Entity[], owner: Owner, memory: AiMe
   const objective =
     structures.find((e) => e.kind === "towncenter") ??
     structures.find((e) => e.kind === "barracks") ??
-    structures[0];
+    structures[0] ??
+    // Nothing found yet (the scout died, say): march on the enemy's start.
+    // Without this fallback a blind AI never attacks at all.
+    world.starts[owner === 0 ? 1 : 0];
   if (!objective) return;
 
   // Alternate between razing the base and raiding the economy.
@@ -422,11 +499,17 @@ function considerAttack(world: World, army: Entity[], owner: Owner, memory: AiMe
   // (Flanking routes were tried here first and measurably hurt — splitting the
   // approach added travel time and weakened every push. Resolution rate fell
   // from 4 seeds in 8 to 2.)
-  const workers = targets.filter((e) => e.kind === "villager");
-  const raid = memory.wave % 3 !== 0 && workers.length >= 3;
-  const aim = raid ? workers[Math.floor(rand(world) * workers.length)] : objective;
+  const sightings = memory.workerSightings;
+  const raid = memory.wave % 3 !== 0 && sightings.length >= 2;
+  const aim = raid ? sightings[Math.floor(rand(world) * sightings.length)] : objective;
 
-  for (const s of army) commandAttackMove(world, s, aim.x, aim.y);
+  commandGroup(world, army, {
+    tx: aim.x,
+    ty: aim.y,
+    formation: "line",
+    attack: true,
+    queue: false,
+  });
   memory.wave++;
   memory.nextAttack = 55;
 }
